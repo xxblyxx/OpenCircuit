@@ -218,6 +218,18 @@ struct OpenCircuitApp: App {
 
     /// The schema + default configuration shared by BOTH container builders, so the foreground
     /// (recovering) and background (non-destructive) paths can never drift apart. (#131)
+    ///
+    /// `groupContainer: .none` is NOT the default and MUST stay explicit (docs/WIDGETS_HOME_SCREEN.md
+    /// §1): `ModelConfiguration`'s real default is `.automatic`, which SwiftData resolves to "use
+    /// the app's App Group container" the instant the app target carries the
+    /// `com.apple.security.application-groups` entitlement — which it now does, for the Home
+    /// Screen widget's snapshot channel (`Shared/RingSnapshot.swift`). Left at the default, adding
+    /// that entitlement would have SILENTLY RELOCATED this store into the group container on the
+    /// next launch — precisely the container-open failure path (#40/#131) whose foreground
+    /// recovery WIPES 30 days of un-resyncable raw history, and precisely what §1 says the widget
+    /// design must never cause. Pinning `.none` keeps the store exactly where it has always lived,
+    /// entitlement or not; the widget reaches the group container only through
+    /// `RingSnapshotStore`, which never touches SwiftData at all.
     private static func makeSchemaAndConfig() -> (Schema, ModelConfiguration) {
         // Must list exactly `SchemaV5.models` (the CURRENT version) — the container is built from
         // THIS array, so a model present only in the versioned schema enum would migrate in and then
@@ -226,7 +238,7 @@ struct OpenCircuitApp: App {
                              StoredSleepSummary.self, StoredDaily.self, StoredNap.self,
                              StoredPeriodEntry.self, StoredDaytimeTemp.self, StoredStepSample.self,
                              StoredHeadacheEntry.self, StoredHeadacheRisk.self])
-        return (schema, ModelConfiguration(schema: schema))
+        return (schema, ModelConfiguration(schema: schema, groupContainer: .none))
     }
 
     /// Build the SwiftData container with NO destructive fallback: create the Application Support
@@ -364,7 +376,8 @@ struct OpenCircuitApp: App {
         do {
             return try ModelContainer(for: schema,
                                       configurations: ModelConfiguration(schema: schema,
-                                                                         isStoredInMemoryOnly: true))
+                                                                         isStoredInMemoryOnly: true,
+                                                                         groupContainer: .none))
         } catch {
             // In-memory creation essentially never fails; only here is a last resort acceptable.
             fatalError("Unrecoverable in-memory SwiftData store error: \(error)")

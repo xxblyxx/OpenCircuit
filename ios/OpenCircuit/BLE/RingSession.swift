@@ -3845,6 +3845,17 @@ final class RingSession: NSObject {
         syncing = false
         syncTask = nil
         scheduleDeviceStatusRefresh(reason: "post-sync")
+        // Home Screen widget snapshot (docs/WIDGETS_HOME_SCREEN.md #4): every drain funnels
+        // through here — foreground manual/auto, the periodic/BLE-wake drain, and (via
+        // RingBackgroundSyncService) the background capture — so one hook covers all of them.
+        // Fire-and-forget: `RingSnapshotWriter.refresh` does its own off-main analytics and
+        // never touches the SwiftData store from anywhere but the app process, so it must never
+        // block sync completion above. A missing `localStore` (never wired) just skips silently.
+        if let localStore {
+            Task { @MainActor [weak self] in
+                await RingSnapshotWriter.refresh(store: localStore, session: self)
+            }
+        }
     }
 
     private func finishActiveDrainTrace(_ exitReason: HistoryChannelExitReason) {

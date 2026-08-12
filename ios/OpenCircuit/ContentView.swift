@@ -221,6 +221,13 @@ struct ContentView: View {
                     handleForegroundActivation()
                     refreshObservability()        // pick up anything a background run wrote
                     evaluateForegroundAlerts()    // live battery + Health-auth check (#44)
+                    // Home Screen widget snapshot (docs/WIDGETS_HOME_SCREEN.md #4): every actual
+                    // sync already funnels through RingSession.finalizeSync, but a night's
+                    // "ended today" gate (sleepIsLastNight) is a function of the CURRENT date, not
+                    // just fresh data — opening the app the morning after, with no new sync due
+                    // yet, is what re-evaluates it to false. Also the only refresh that reaches a
+                    // widget when the ring never connects at all this session.
+                    Task { await RingSnapshotWriter.refresh(store: LocalStore(modelContext), session: session) }
 #if DEBUG
                     // #152: dev-only localhost BP-estimate poll; never runs in Release.
                     Task { await calibration.refreshLatestEstimateIfNeeded() }

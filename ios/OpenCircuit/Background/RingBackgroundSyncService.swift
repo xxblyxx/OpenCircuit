@@ -88,6 +88,16 @@ struct RingBackgroundSyncService {
             if mirrored { ObservabilityStore().recordHealthWrite() }
         }
 
+        // Home Screen widget snapshot (docs/WIDGETS_HOME_SCREEN.md #4). `RingSession.finalizeSync`
+        // already covers the branch where `captureForBackground` actually drained (`didDrain`), but
+        // the flush-FIRST branch above (F1, `preMirrored`) can be the ONLY thing that happened on a
+        // short app-refresh window — zero BLE, so `finalizeSync` never ran — and that path can still
+        // move `lastSyncAt`/Health forward. Calling it here too is cheap: `RingSnapshotWriter.refresh`
+        // no-ops when nothing the widget shows actually changed.
+        if preMirrored || mirrored || capture.gotData {
+            await RingSnapshotWriter.refresh(store: store, session: scanner.session)
+        }
+
         // Phase-timing breadcrumb (#119 early-termination): splits the wake into connect vs drain vs
         // flush so the next activity-log export can attribute an early kill to a CONNECT-overrun (F3
         // irrelevant) vs a DRAIN-overrun (F3 relevant) — an open question the 7d log couldn't answer
