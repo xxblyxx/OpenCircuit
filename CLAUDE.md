@@ -68,6 +68,33 @@ Health** — no cloud, no subscription.
 | `docs/ROADMAP.md` | Phases + risks |
 | `ios/` | Swift app (Phase 3+, not yet created) |
 
+## Build & deploy to the iPhone
+**Not using TestFlight right now.** Build locally and install straight to the paired
+phone over the wire — no App Store Connect key, no interactive Xcode sign-in needed.
+
+> ⚠️ Always regenerate with **`--spec project.local.yml`**. A bare `xcodegen generate`
+> rewrites the project with upstream's paid team (`765RD9BJ8C`), which this Mac has no
+> account for → signing dies with *"No Account for Team"*. `project.local.yml`
+> (gitignored) includes `project.yml` and overrides only signing: personal team
+> `KNK78KA6NE`, bundle id `com.bly.opencircuit`.
+
+```bash
+cd ios
+DEV=819D37A3-B45A-56CF-9FEC-40D460EC74F8   # Jedi Master's iPhone — `xcrun devicectl list devices`
+xcodegen generate --spec project.local.yml
+xcodebuild -project OpenCircuit.xcodeproj -scheme OpenCircuit -configuration Debug \
+  -destination "id=$DEV" -allowProvisioningUpdates build
+APP="$(xcodebuild -project OpenCircuit.xcodeproj -scheme OpenCircuit -configuration Debug \
+  -destination "id=$DEV" -showBuildSettings 2>/dev/null \
+  | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{print $2; exit}')/OpenCircuit.app"
+xcrun devicectl device install app --device "$DEV" "$APP"
+xcrun devicectl device process launch --device "$DEV" com.bly.opencircuit
+```
+
+- Simulator instead: `-destination 'platform=iOS Simulator,name=iPhone 17'` (no "iPhone 16"
+  simulator exists on this Mac).
+- Widget changes: the Home Screen widget may need removing + re-adding to pick up a new layout.
+
 ## Conventions
 - Captures in `desktop/captures/` are gitignored — they hold real health data. Commit
   decoded *findings* only, never raw captures.

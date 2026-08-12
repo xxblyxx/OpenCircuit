@@ -92,7 +92,10 @@ struct RingSnapshotMediumView: View {
                     RingMetricColumn(title: "Sleep",
                                      value: snapshot.sleepIsLastNight ? snapshot.sleepScore.map(String.init) : nil,
                                      sub: nil,
-                                     color: WidgetPalette.sleepTierColor(snapshot.sleepBand))
+                                     color: WidgetPalette.sleepTierColor(snapshot.sleepBand),
+                                     progress: snapshot.sleepIsLastNight
+                                        ? WidgetFormat.fraction(snapshot.sleepScore.map(Double.init), goal: 100) : nil,
+                                     ringColor: WidgetPalette.sleepRing)
                     RingMetricColumn(title: "Stress",
                                      value: snapshot.sleepIsLastNight ? snapshot.stressScore.map(String.init) : nil,
                                      sub: nil,
@@ -100,7 +103,9 @@ struct RingSnapshotMediumView: View {
                     RingMetricColumn(title: "Activity",
                                      value: snapshot.activityScore.map(String.init),
                                      sub: nil,
-                                     color: WidgetPalette.activityTierColor(snapshot.activityTier))
+                                     color: WidgetPalette.activityTierColor(snapshot.activityTier),
+                                     progress: WidgetFormat.fraction(snapshot.activityScore.map(Double.init), goal: 100),
+                                     ringColor: WidgetPalette.activityRing)
                 }
                 .opacity(stale ? 0.55 : 1)
                 Divider()
@@ -108,11 +113,16 @@ struct RingSnapshotMediumView: View {
                     RingMetricColumn(title: "Steps",
                                      value: snapshot.steps.map { $0.formatted() },
                                      sub: nil,
-                                     color: WidgetPalette.steps)
+                                     color: WidgetPalette.steps,
+                                     progress: WidgetFormat.fraction(snapshot.steps.map(Double.init),
+                                                                      goal: snapshot.stepsGoal.map(Double.init)),
+                                     ringColor: WidgetPalette.steps)
                     RingMetricColumn(title: "Active kcal",
                                      value: snapshot.activeKcal.map { Int($0).formatted() },
                                      sub: nil,
-                                     color: WidgetPalette.energy)
+                                     color: WidgetPalette.energy,
+                                     progress: WidgetFormat.fraction(snapshot.activeKcal, goal: snapshot.activeKcalGoal),
+                                     ringColor: WidgetPalette.energy)
                     RingMetricColumn(title: "Battery",
                                      value: snapshot.batteryPercent.map { "\($0)%" },
                                      sub: WidgetFormat.batterySub(snapshot),
@@ -146,7 +156,11 @@ struct RingSnapshotLargeView: View {
                 RingMetricColumn(title: "Sleep",
                                  value: snapshot.sleepIsLastNight ? snapshot.sleepScore.map(String.init) : nil,
                                  sub: snapshot.sleepIsLastNight ? WidgetPalette.sleepTierLabel(snapshot.sleepBand) : "—",
-                                 color: WidgetPalette.sleepTierColor(snapshot.sleepBand))
+                                 color: WidgetPalette.sleepTierColor(snapshot.sleepBand),
+                                 progress: snapshot.sleepIsLastNight
+                                    ? WidgetFormat.fraction(snapshot.sleepScore.map(Double.init), goal: 100) : nil,
+                                 ringColor: WidgetPalette.sleepRing,
+                                 ringSize: 36, ringLineWidth: 5)
                 RingMetricColumn(title: "Stress",
                                  value: snapshot.sleepIsLastNight ? snapshot.stressScore.map(String.init) : nil,
                                  sub: snapshot.sleepIsLastNight ? WidgetPalette.stressLabel(snapshot.stressBand) : "—",
@@ -154,18 +168,28 @@ struct RingSnapshotLargeView: View {
                 RingMetricColumn(title: "Activity",
                                  value: snapshot.activityScore.map(String.init),
                                  sub: WidgetPalette.activityTierLabel(snapshot.activityTier),
-                                 color: WidgetPalette.activityTierColor(snapshot.activityTier))
+                                 color: WidgetPalette.activityTierColor(snapshot.activityTier),
+                                 progress: WidgetFormat.fraction(snapshot.activityScore.map(Double.init), goal: 100),
+                                 ringColor: WidgetPalette.activityRing,
+                                 ringSize: 36, ringLineWidth: 5)
             }
             .opacity(stale ? 0.55 : 1)
             HStack(spacing: 10) {
                 RingMetricColumn(title: "Steps",
                                  value: snapshot.steps.map { $0.formatted() },
                                  sub: snapshot.stepsGoal.map { "of \($0.formatted())" },
-                                 color: WidgetPalette.steps)
+                                 color: WidgetPalette.steps,
+                                 progress: WidgetFormat.fraction(snapshot.steps.map(Double.init),
+                                                                  goal: snapshot.stepsGoal.map(Double.init)),
+                                 ringColor: WidgetPalette.steps,
+                                 ringSize: 36, ringLineWidth: 5)
                 RingMetricColumn(title: "Active kcal",
                                  value: snapshot.activeKcal.map { Int($0).formatted() },
                                  sub: snapshot.activeKcalGoal.map { "of \(Int($0))" },
-                                 color: WidgetPalette.energy)
+                                 color: WidgetPalette.energy,
+                                 progress: WidgetFormat.fraction(snapshot.activeKcal, goal: snapshot.activeKcalGoal),
+                                 ringColor: WidgetPalette.energy,
+                                 ringSize: 36, ringLineWidth: 5)
                 RingMetricColumn(title: "Battery",
                                  value: snapshot.batteryPercent.map { "\($0)%" },
                                  sub: WidgetFormat.batterySub(snapshot),
@@ -272,27 +296,69 @@ struct RingSnapshotEmptyView: View {
 
 // MARK: - Shared pieces
 
-/// One metric's number + title + optional sub-line, reused by the medium and large faces so the
-/// two layouts can never drift into showing the same metric two different ways.
+/// One metric's number + title + optional sub-line, plus an optional goal ring on its leading
+/// edge — reused by the medium and large faces so the two layouts can never drift into showing
+/// the same metric two different ways. `progress == nil` (no goal, e.g. Stress/Battery, or a
+/// missing value) still reserves the ring's width as blank space rather than collapsing it, so
+/// every number in a row starts at the same x whether or not its column has a ring.
 private struct RingMetricColumn: View {
     let title: String
     let value: String?
     let sub: String?
     let color: Color
+    /// Fraction toward goal, already clamped to 0...1 by `WidgetFormat.fraction`. `nil` ⇒ no ring
+    /// drawn (Stress/Battery, or a missing value) — never a fabricated 0%-filled ring.
+    var progress: Double? = nil
+    var ringColor: Color = .secondary
+    var ringSize: CGFloat = 29
+    var ringLineWidth: CGFloat = 4
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(value ?? "—")
-                .font(.system(size: 20, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(value == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(color))
-                .lineLimit(1).minimumScaleFactor(0.7)
-            Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
-            if let sub, !sub.isEmpty {
-                Text(sub).font(.system(size: 8)).foregroundStyle(.tertiary).lineLimit(1)
+        HStack(alignment: .center, spacing: 10) {
+            if let progress {
+                GoalRing(fraction: progress, color: ringColor, size: ringSize, lineWidth: ringLineWidth)
+            } else {
+                Color.clear.frame(width: ringSize, height: ringSize)
             }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(value ?? "—")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(value == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(color))
+                    .lineLimit(1).minimumScaleFactor(0.7)
+                Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
+                if let sub, !sub.isEmpty {
+                    Text(sub).font(.system(size: 8)).foregroundStyle(.tertiary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 2)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(progress.map { "\(value ?? "—"), \(Int($0 * 100)) percent" } ?? (value ?? "no data"))
+    }
+}
+
+/// Plain goal ring for the medium/large faces — a scaled-down, static copy of the Activity tab's
+/// `GoalsCardView.goalRing` (7pt stroke, 15% track, round cap, 12 o'clock start): widget target has
+/// no access to the app's SwiftUI source, and a widget face is a static render anyway, so this
+/// drops that view's animation and its centre percent/checkmark (a plain ring was asked for).
+private struct GoalRing: View {
+    let fraction: Double          // already clamped to 0...1 by WidgetFormat.fraction
+    let color: Color
+    let size: CGFloat
+    let lineWidth: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(color.opacity(0.15), lineWidth: lineWidth)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: size, height: size)
     }
 }
 
@@ -335,6 +401,11 @@ enum WidgetPalette {
     static let background = Color(uiColor: .systemBackground)
     static let steps = Color.green
     static let energy = Color.orange
+    // Fixed goal-ring colours, matching the Activity tab's Daily Goals rings
+    // (GoalsCardView.swift's goalRing call sites) — deliberately NOT the tier colour, which the
+    // number keeps. Steps/energy double as both number and ring colour already, above.
+    static let sleepRing = Color.purple
+    static let activityRing = Color.blue
 
     // Sleep / activity tiers share OpenCircuitKit's cut-offs (SleepScore.Tier / ActivityScore.Tier
     // raw values: "excellent"/"good"/"needsImprovement") but the widget can't import the Kit to
@@ -410,6 +481,16 @@ enum WidgetPalette {
 }
 
 enum WidgetFormat {
+    /// Mirrors `OpenCircuitKit.GoalProgress.fraction` (unreachable from this Kit-free target):
+    /// clamped to 0...1, `nil` when either input is missing or the goal isn't positive. Kept
+    /// identical so a widget ring can never disagree with the same ring on the Activity tab.
+    /// `nil` in ⇒ no ring drawn (`RingMetricColumn` treats `nil` as a blank slot) — never a
+    /// fabricated 0%-filled ring for a value the app hasn't computed.
+    static func fraction(_ current: Double?, goal: Double?) -> Double? {
+        guard let current, let goal, goal > 0 else { return nil }
+        return min(max(current / goal, 0), 1)
+    }
+
     static func duration(_ minutes: Int) -> String {
         let h = minutes / 60, m = minutes % 60
         if h > 0 && m > 0 { return "\(h)h\(m)m" }
