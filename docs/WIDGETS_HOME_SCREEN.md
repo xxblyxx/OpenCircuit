@@ -1,7 +1,11 @@
 # Home Screen Widgets — plan of record
 
-Status: **PROPOSED — nothing built.** No Home Screen or StandBy widget exists in this repo
-today (`WorkoutWidget/WorkoutWidgetBundle.swift` says so in its own header).
+Status: **BUILT** (branch `docs/home-screen-widgets`, 2026-08-12). `WorkoutWidget/
+RingSnapshotWidget.swift` + `RingSnapshotViews.swift` render `systemSmall` / `systemMedium` /
+`systemLarge` / `accessoryCircular` from a snapshot `OpenCircuit/Widgets/RingSnapshotWriter.swift`
+writes into the App Group container after each sync. §1's invariant held: the SwiftData store was
+never relocated — see the new subsection at the end of §1, which documents a real near-miss the
+build surfaced and fixed, not merely a design worry.
 
 Provenance: a survey pass over (a) this codebase at `1511e7f` (build 41), (b) published
 coverage of the official RingConn app's iOS widget. Everything tagged 🟢 below was verified
@@ -53,6 +57,42 @@ snapshot is a stale widget — not data loss.
 > ⚠️ **The invariant this plan must not break:** nothing in the widget path may move, open, or
 > write the app's SwiftData store. If an implementation finds itself needing the store from the
 > extension, the design is wrong — stop and revisit §1.
+
+### 1.1. The invariant almost broke from a direction nobody was watching 🟢
+
+The design above reasons about what the **widget** touches. It missed a second way the App Group
+entitlement threatens the store, with no widget code involved at all: `ModelConfiguration`'s real
+default is `groupContainer: .automatic`, and SwiftData's documented behavior for `.automatic` is
+"if the target carries the `com.apple.security.application-groups` entitlement, store new/opened
+containers inside the **first** App Group". `App.swift`'s `makeSchemaAndConfig()` — used by both
+`makeContainerOrThrow()` and the recovery path — built its `ModelConfiguration` with no
+`groupContainer` argument, i.e. at that default, from before this feature existed.
+
+So the moment the app target gained the App Group entitlement (Step 1, needed for the widget
+snapshot and nothing else), the **next app launch** would have had SwiftData silently try to open
+the main store inside `group.com.bly.opencircuit` instead of the app's own container — a location
+with nothing in it. That is not a hypothetical: it reproduced on the first simulator run after the
+entitlement landed (`CoreData: error: ... Containers/Shared/AppGroup/.../default.store`), before
+`groupContainer: .none` was added. Had that build reached the device and been launched, it is
+exactly the container-open-failure shape `wipeAndRecoverForeground` exists for — the store SwiftData
+tries to open is unpopulated, the open effectively "fails" to find prior data, and the foreground
+recovery path would have treated it as first-launch-shaped, silently starting the user over rather
+than opening their real history sitting one directory away.
+
+**Fix:** `makeSchemaAndConfig()` now passes `groupContainer: .none` explicitly, and the in-memory
+fallback (`inMemoryContainer`) is pinned the same way for defense in depth even though an in-memory
+store has no location to relocate. This is a **one-line, load-bearing pin** — nothing else in the
+codebase enforces it — so:
+
+> ⚠️ **Second invariant, alongside the one above:** any `ModelConfiguration` for the app's
+> persistent store MUST specify `groupContainer: .none` explicitly. Do not rely on it being unset
+> meaning "no group" — once the App Group entitlement exists on the app target (which it now
+> permanently does, for this feature), unset means the opposite.
+
+This was caught only because a routine simulator test run logs `CoreData: error:` lines to stderr
+and they were read rather than ignored — nothing in the type system flags a silently-wrong default
+argument. `docs/HANDOFF_MACOS_IOS.md` / whoever next edits `App.swift`'s container builders should
+know this pin exists and why before touching it.
 
 ---
 
@@ -125,8 +165,18 @@ any UI work starts.
 ## 5. Fork / upstream considerations
 
 - `OpenCircuit/OpenCircuit.entitlements` is committed upstream, so adding an App Group edits a
-  tracked file. Prefer pointing `ios/project.local.yml` at a local entitlements file, the same
-  pattern already used to override signing — keeps `git merge upstream/master` clean.
+  tracked file. 🟢 **Decision: local spec only.** `ios/project.local.yml` points both targets at
+  gitignored `*.local.entitlements` files (the same pattern already used to override signing), so
+  `OpenCircuit/OpenCircuit.entitlements`, `project.yml`, and `git merge upstream/master` are never
+  touched. Accepted consequence: a fresh clone builds the widget extension, but it renders its
+  "open the app" placeholder until someone's own `project.local.yml` provisions the App Group —
+  there is no snapshot to read without it. Each target DERIVES the group id from its own
+  `Bundle.main.bundleIdentifier` (`Shared/RingSnapshot.swift`) rather than reading it from a
+  second tracked-file edit — Info.plist plumbing was tried first and reverted: once a target's
+  `INFOPLIST_FILE` points anywhere but the tracked `OpenCircuit/Info.plist`, Xcode stops excluding
+  that old file from Copy Bundle Resources and it collides with the new one on the same output
+  path ("Multiple commands produce .../Info.plist"). Deriving from the bundle id sidesteps the
+  whole class of problem and needs no entitlements/Info.plist round-trip to add a metric later.
 - **Do NOT contribute this upstream.** See the banner at the top of `CLAUDE.md`: this is a
   personal learning fork and nothing is PR'd back. (Noted only because the design in §1 would
   otherwise be a natural answer to the objection recorded in `HeadacheQuickLink.swift` — it
@@ -136,14 +186,22 @@ any UI work starts.
 
 ---
 
-## 6. Open questions
+## 6. Open questions — resolved at implementation
 
-1. 🔴 Which widget families and which metric-per-widget model does RingConn actually use?
-   Worth one look at the real app before committing to a layout.
-2. 🟡 Which metrics belong on a small widget? Six will not fit legibly. Battery + steps +
-   sleep score is a plausible default, but this is a design call, not a derived one.
-3. 🟡 Snapshot write frequency vs. WidgetKit's refresh budget — iOS throttles timeline reloads,
-   so writing on every sync may not translate to a visible update on every sync.
-4. 🔴 Does anything in the background-sync path (`docs/BACKGROUND_SYNC.md`, #119) already run
-   often enough to keep a widget usefully fresh, or does the widget inherit the same
-   best-effort caveats documented there?
+1. 🔴 **Still open, deliberately.** Which widget families and which metric-per-widget model
+   RingConn actually uses was never checked against the real app or a decompile — this repo built
+   its own layout instead and treats the six-metric list as evidence of usefulness, not a spec.
+2. 🟢 **Decided.** Small face: sleep score hero (tier-coloured) + steps + ring battery, with the
+   snapshot's age always on the face. Medium/large add stress, activity score, active kcal;
+   large adds last night's stage bar. `accessoryCircular` (Lock Screen) shows sleep score alone.
+3. 🟢 **Resolved — not a real constraint.** The app never called `WidgetCenter` before this
+   feature. App-initiated `reloadAllTimelines()` is not charged against the widget's own
+   timeline-refresh budget (that throttling applies to `TimelineReloadPolicy`-driven refreshes);
+   the throttling that matters is `RingSnapshotWriter`'s own no-op check
+   (`RingSnapshot.hasSameDisplayValues`), which skips the write — and therefore the reload —
+   when a periodic empty drain produced nothing the widget shows differently.
+4. 🟢 **Resolved.** The widget inherits `docs/BACKGROUND_SYNC.md`'s caveats wholesale: every wake
+   is at iOS's discretion, and the referenced 7-day activity log showed roughly a third of
+   app-refresh runs ending early. Hours-old data is the NORMAL case, not a failure mode — which is
+   why every face but `accessoryCircular` puts the sync age on its own face rather than treating
+   staleness as something to hide (§4, §5's "show the staleness" rule).
