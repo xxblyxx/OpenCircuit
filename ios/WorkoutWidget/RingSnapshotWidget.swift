@@ -39,11 +39,20 @@ struct RingSnapshotProvider: TimelineProvider {
         let now = Date()
         let snapshot = RingSnapshotStore.read()
         var entries = [RingSnapshotEntry(date: now, snapshot: snapshot)]
-        // A second entry at the exact moment this data crosses into "stale", so the face visibly
-        // dims on its own even if the app never writes again (§4: "show the staleness" — no
-        // hours-old reading may sit there looking as fresh as the moment it landed).
+        // A ladder of entries every 15 min out to the exact moment this data crosses into "stale".
+        // FreshnessCaption shows a precomputed "N min/hr ago" string rather than live Text (see its
+        // doc comment — live text there defeated the corner-pin and, worse, blanked the whole face),
+        // so THIS is what advances the caption now; it also still dims the face at the stale
+        // transition even if the app never writes again (§4: "show the staleness" — no hours-old
+        // reading may sit there looking as fresh as the moment it landed). 15 min matches
+        // relativeSince's own rounding, so the granularity loss is invisible.
         if let snapshot {
             let staleAt = snapshot.lastSyncAt.addingTimeInterval(snapshot.staleAfter)
+            var next = now.addingTimeInterval(15 * 60)
+            while next < staleAt {
+                entries.append(RingSnapshotEntry(date: next, snapshot: snapshot))
+                next = next.addingTimeInterval(15 * 60)
+            }
             if staleAt > now {
                 entries.append(RingSnapshotEntry(date: staleAt, snapshot: snapshot))
             }

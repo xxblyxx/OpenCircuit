@@ -82,46 +82,49 @@ struct RingSnapshotMediumView: View {
 
     var body: some View {
         let stale = snapshot.isStale(now: now)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("OPENCIRCUIT").font(.system(size: 9).weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-                FreshnessCaption(snapshot: snapshot, now: now)
+        // ZStack(alignment:) pins FreshnessCaption's frame to the bottom-trailing corner — this
+        // only works because the caption is now a plain (non-live) Text that measures to exactly
+        // its glyphs; see FreshnessCaption's doc comment for why the earlier live-text version
+        // defeated this corner-pin no matter which container held it.
+        ZStack(alignment: .bottomTrailing) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    RingMetricColumn(title: "Sleep",
+                                     value: snapshot.sleepIsLastNight ? snapshot.sleepScore.map(String.init) : nil,
+                                     sub: nil,
+                                     color: WidgetPalette.sleepTierColor(snapshot.sleepBand))
+                    RingMetricColumn(title: "Stress",
+                                     value: snapshot.sleepIsLastNight ? snapshot.stressScore.map(String.init) : nil,
+                                     sub: nil,
+                                     color: WidgetPalette.stressColor(snapshot.stressBand))
+                    RingMetricColumn(title: "Activity",
+                                     value: snapshot.activityScore.map(String.init),
+                                     sub: nil,
+                                     color: WidgetPalette.activityTierColor(snapshot.activityTier))
+                }
+                .opacity(stale ? 0.55 : 1)
+                Divider()
+                HStack(spacing: 8) {
+                    RingMetricColumn(title: "Steps",
+                                     value: snapshot.steps.map { $0.formatted() },
+                                     sub: nil,
+                                     color: WidgetPalette.steps)
+                    RingMetricColumn(title: "Active kcal",
+                                     value: snapshot.activeKcal.map { Int($0).formatted() },
+                                     sub: nil,
+                                     color: WidgetPalette.energy)
+                    RingMetricColumn(title: "Battery",
+                                     value: snapshot.batteryPercent.map { "\($0)%" },
+                                     sub: WidgetFormat.batterySub(snapshot),
+                                     color: WidgetPalette.batteryColor(percent: snapshot.batteryPercent,
+                                                                       charging: snapshot.batteryCharging))
+                }
+                .opacity(stale ? 0.55 : 1)
             }
-            HStack(spacing: 8) {
-                RingMetricColumn(title: "Sleep",
-                                 value: snapshot.sleepIsLastNight ? snapshot.sleepScore.map(String.init) : nil,
-                                 sub: snapshot.sleepIsLastNight ? WidgetPalette.sleepTierLabel(snapshot.sleepBand) : "—",
-                                 color: WidgetPalette.sleepTierColor(snapshot.sleepBand))
-                RingMetricColumn(title: "Stress",
-                                 value: snapshot.sleepIsLastNight ? snapshot.stressScore.map(String.init) : nil,
-                                 sub: snapshot.sleepIsLastNight ? WidgetPalette.stressLabel(snapshot.stressBand) : "—",
-                                 color: WidgetPalette.stressColor(snapshot.stressBand))
-                RingMetricColumn(title: "Activity",
-                                 value: snapshot.activityScore.map(String.init),
-                                 sub: WidgetPalette.activityTierLabel(snapshot.activityTier),
-                                 color: WidgetPalette.activityTierColor(snapshot.activityTier))
-            }
-            .opacity(stale ? 0.55 : 1)
-            Divider()
-            HStack(spacing: 8) {
-                RingMetricColumn(title: "Steps",
-                                 value: snapshot.steps.map { $0.formatted() },
-                                 sub: snapshot.stepsGoal.map { "of \($0.formatted())" },
-                                 color: WidgetPalette.steps)
-                RingMetricColumn(title: "Active kcal",
-                                 value: snapshot.activeKcal.map { Int($0).formatted() },
-                                 sub: snapshot.activeKcalGoal.map { "of \(Int($0))" },
-                                 color: WidgetPalette.energy)
-                RingMetricColumn(title: "Battery",
-                                 value: snapshot.batteryPercent.map { "\($0)%" },
-                                 sub: WidgetFormat.batterySub(snapshot),
-                                 color: WidgetPalette.batteryColor(percent: snapshot.batteryPercent,
-                                                                   charging: snapshot.batteryCharging))
-            }
-            .opacity(stale ? 0.55 : 1)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+
+            FreshnessCaption(snapshot: snapshot, now: now, size: 10)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
 
@@ -293,20 +296,35 @@ private struct RingMetricColumn: View {
     }
 }
 
-/// "Synced 2 hr" (self-updating via `Text(_:style:)`, no timeline entry needed to advance it),
-/// turning amber past `staleAfter` — the one thing every face except `accessoryCircular` always
-/// shows, per §4: no reading may sit on the face looking as fresh as the moment it landed.
+/// "Synced 4 min ago", turning amber past `staleAfter` — the one thing every face except
+/// `accessoryCircular` always shows, per §4: no reading may sit on the face looking as fresh as the
+/// moment it landed.
+///
+/// Deliberately a plain `Text(String)`, NOT `Text(_:style:.relative)`. Live relative-time Text
+/// reserves width for the WIDEST value it could grow into ("Synced 59 min ago" vs "Synced 4 min
+/// ago"), not the glyphs it's showing right now — so on the medium/large faces, whose corner-pin
+/// (ZStack(.bottomTrailing) / a header Spacer()) assumes the view's frame matches its glyphs, the
+/// caption rendered against the LEFT edge of its own oversized frame instead of the corner.
+/// Wrapping it in `.fixedSize(horizontal: true, ...)` to fight that was tried and is WORSE: it
+/// blanks the entire widget face (all three families), because that modifier forces an ideal-width
+/// measurement WidgetKit's live-text rendering can't satisfy. Precomputing the string via
+/// `WidgetFormat.relativeSince` sidesteps both — a plain string measures to exactly its glyphs, so
+/// the corner-pin just works. The cost is the caption no longer ticks live; the provider
+/// (`RingSnapshotWidget.swift`) advances it on a coarse timeline instead.
 private struct FreshnessCaption: View {
     let snapshot: RingSnapshot
     let now: Date
+    /// Text size; the warning triangle stays one point smaller, matching the original 7/8 ratio.
+    /// Defaults to the small/large faces' size — the medium face passes a larger override.
+    var size: CGFloat = 8
 
     var body: some View {
         let stale = snapshot.isStale(now: now)
         HStack(spacing: 3) {
-            if stale { Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 7)) }
-            Text("Synced ") + Text(snapshot.lastSyncAt, style: .relative)
+            if stale { Image(systemName: "exclamationmark.triangle.fill").font(.system(size: size - 1)) }
+            Text("Synced \(WidgetFormat.relativeSince(snapshot.lastSyncAt, now: now))")
         }
-        .font(.system(size: 8))
+        .font(.system(size: size))
         .foregroundStyle(stale ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
     }
 }
@@ -397,6 +415,19 @@ enum WidgetFormat {
         if h > 0 && m > 0 { return "\(h)h\(m)m" }
         if h > 0 { return "\(h)h" }
         return "\(m)m"
+    }
+
+    /// "4 min ago" / "2 hr ago" / "3 d ago" — coarse on purpose. `FreshnessCaption` shows this
+    /// instead of live relative-time `Text` (see its doc comment), and the provider only refreshes
+    /// the timeline every 15 min, so rounding tighter than that would imply false precision.
+    static func relativeSince(_ date: Date, now: Date) -> String {
+        let seconds = max(now.timeIntervalSince(date), 0)
+        let minutes = Int(seconds / 60)
+        if minutes < 1 { return "just now" }
+        if minutes < 60 { return "\(minutes) min ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours) hr ago" }
+        return "\(hours / 24) d ago"
     }
 
     static func batteryIcon(_ pct: Int) -> String {
