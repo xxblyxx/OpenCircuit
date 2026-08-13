@@ -49,6 +49,17 @@ Health** — no cloud, no subscription.
 - Analytics ported **natively to Swift** (no Rust/UniFFI).
 - User has the ring and can capture Android HCI snoop logs.
 
+## git branching
+Maintain the integrity of `master` — always create a branch to work from. Before
+implementing any code change, if you are on `master`, ask the user whether to create
+a branch and recommend a branch name. Do not start editing until that's settled.
+
+- This applies to code changes, not to docs-only tweaks the user asked for directly.
+- Branch names follow the existing convention: `feat/…`, `fix/…`, `docs/…`.
+- Merging back to `master` is the user's call — don't merge without being asked.
+- (Reminder: `origin` is `xxblyxx/OpenCircuit`. Branches never go to `upstream` —
+  see the no-upstream-contributions rule at the top.)
+
 ## Map
 | Path | What |
 |---|---|
