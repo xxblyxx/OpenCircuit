@@ -18,6 +18,9 @@ venv/
 *.sqlite
 *.db
 
+# Scratch
+tmp/
+
 # OS / editor
 .DS_Store
 Thumbs.db
