@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Skip all BLE/HealthKit/BackgroundTasks startup work under XCTest (2026-08-12) — see
+        // `OpenCircuitApp.isRunningUnitTests`. None of it is needed to run a unit test, and doing
+        // it anyway is what made `OpenCircuitTests` unable to launch at all.
+        guard !OpenCircuitApp.isRunningUnitTests else { return true }
         // Show health alerts / reminders even when the app is in the FOREGROUND — which is the
         // primary moment they're evaluated (scenePhase==.active and on sync completion). Without
         // a delegate returning presentation options, iOS silently suppresses foreground-delivered

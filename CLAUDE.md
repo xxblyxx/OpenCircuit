@@ -93,7 +93,6 @@ xcrun devicectl device process launch --device "$DEV" com.bly.opencircuit
 
 - Simulator instead: `-destination 'platform=iOS Simulator,name=iPhone 17'` (no "iPhone 16"
   simulator exists on this Mac).
-- Widget changes: the Home Screen widget may need removing + re-adding to pick up a new layout.
 
 ## Conventions
 - Captures in `desktop/captures/` are gitignored — they hold real health data. Commit

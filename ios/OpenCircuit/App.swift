@@ -9,6 +9,19 @@ struct OpenCircuitApp: App {
     @Environment(\.scenePhase) private var scenePhase
     private let container = OpenCircuitApp.makeContainer()
 
+    /// True when XCTest injected itself into this process (`xcodebuild test` or Xcode's Test
+    /// navigator) — as opposed to a normal launch, including one a UI test drives. Gates the
+    /// BLE/HealthKit/BackgroundTasks startup work in `AppDelegate.didFinishLaunchingWithOptions`
+    /// and `ContentView`'s main `.task`: a full production launch there (ring reconnect over
+    /// real CoreBluetooth, HealthKit flush, BGTask scheduling) either has no ring to reconnect to
+    /// in the Simulator (crashes) or runs long enough on a real device that XCTest's launch
+    /// handshake times out before a single test executes — the host process gets killed and
+    /// relaunched, over and over, with zero tests ever run (2026-08-12, `OpenCircuitTests` was
+    /// entirely unable to execute in this state; see `WorkoutHRBackfillIngestTests`).
+    static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
