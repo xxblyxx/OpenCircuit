@@ -218,6 +218,38 @@ final class WorkoutSessionTests: XCTestCase {
         XCTAssertEqual(summary.distanceMeters, 500)
     }
 
+    /// `persistableSamples(sessionEnd:)` — what `WorkoutSessionManager` hands to `LocalStore`
+    /// (2026-08-12 fix). Fed 2 s-stamped, 10 s-cadence readings (the real shape `collectHRSnapshot`
+    /// produces), it must return the TRUE cadence, not the stamp.
+    func testPersistableSamplesAreHeldCorrected() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 30)
+        for i in 0..<4 {
+            agg.add(sample: HRSample(bpm: 140, start: t0.addingTimeInterval(Double(i) * 10),
+                                     end: t0.addingTimeInterval(Double(i) * 10 + 2)))   // 2 s stamp
+        }
+        let corrected = agg.persistableSamples(sessionEnd: t0.addingTimeInterval(45))
+        XCTAssertEqual(corrected.count, 4)
+        for i in 0..<3 {
+            XCTAssertEqual(corrected[i].end.timeIntervalSince(corrected[i].start), 10, accuracy: 0.001)
+        }
+        XCTAssertEqual(corrected[3].end.timeIntervalSince(corrected[3].start), 15, accuracy: 0.001)
+    }
+
+    /// `collectedSamples` stays RAW — it's what `writeWorkout` hands to `HKWorkoutBuilder`, a path
+    /// already verified correct on-device, and deliberately untouched by the held-forward
+    /// correction that only applies to what gets persisted to `LocalStore`.
+    func testCollectedSamplesRemainRawUnlikePersistableSamples() {
+        let t0 = Date(timeIntervalSince1970: 0)
+        let agg = WorkoutSessionAggregator(startDate: t0, userAge: 30)
+        agg.add(sample: HRSample(bpm: 140, start: t0, end: t0.addingTimeInterval(2)))
+        agg.add(sample: HRSample(bpm: 140, start: t0.addingTimeInterval(10), end: t0.addingTimeInterval(12)))
+
+        XCTAssertEqual(agg.collectedSamples.map { $0.end.timeIntervalSince($0.start) }, [2, 2])
+        XCTAssertEqual(agg.persistableSamples(sessionEnd: t0.addingTimeInterval(20))
+                          .map { $0.end.timeIntervalSince($0.start) }, [10, 10])
+    }
+
     // MARK: - HR backfill (workout window) + distance-based active-energy fallback
 
     func testBackfillMergesInWindowStoredHRDedupedByTimestamp() {

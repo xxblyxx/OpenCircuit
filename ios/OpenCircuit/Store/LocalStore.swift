@@ -730,6 +730,73 @@ struct LocalStore {
         return ingested
     }
 
+    /// Persist a KNOWN, BOUNDED window of samples whose identity is already certain — e.g. a
+    /// just-finished workout's continuous HR — WITHOUT touching the ingest `SyncCursor`.
+    ///
+    /// WHY THIS EXISTS, NOT `ingest`: `ingest`'s SyncCursor uses time-ordering as a proxy for
+    /// "have I stored this already" — correct for a forward-moving history stream, where nothing
+    /// legitimate ever arrives out of order. A workout backfill breaks that assumption on purpose:
+    /// `WorkoutSessionManager` defers this call until AFTER `writeWorkout` has banked the
+    /// HealthKit active-energy credit (ordering that prevents a permanent double-count there), and
+    /// by then ordinary live-HR spot reads taken DURING the workout have already advanced the
+    /// `heartRate` watermark past the workout's own samples. Every one of them then reads as
+    /// "older than what I have" and `ingest` silently drops the entire workout — a real workout
+    /// vanishing from Goals/Trends/the export while still landing correctly in Apple Health,
+    /// caught only by comparing the two (2026-08-12, this fix).
+    ///
+    /// This method sidesteps the whole class of problem by testing IDENTITY instead of recency:
+    /// a sample is new iff no existing row shares its exact `(kind, start)`. Modeled on the
+    /// dedup-by-natural-key pattern of the reference offline-strap-companion prior art surveyed
+    /// for this fix (ryanbr/noop's `ON CONFLICT(deviceId, ts) DO NOTHING` stream tables) —
+    /// SwiftData has no upsert primitive, so this reproduces it with one range fetch instead.
+    ///
+    /// - Cumulative counters (`.steps`, `.activeEnergy`) are REJECTED — `ingest`'s day-chain
+    ///   delta accumulator assumes strictly-ordered forward arrival, which a backfill violates.
+    ///   Callers pass instantaneous kinds only (workout HR is `.heartRate`).
+    /// - No `StoredCursor` row of ANY kind (ingest, `hk:`, `export:`) is read or written. The
+    ///   HealthKit mirror watermark in particular must stay exactly where `writeWorkout` left it —
+    ///   these samples were already written to Health directly via `HKWorkoutBuilder`, and
+    ///   `pendingHealthSamples()` filtering on that untouched watermark is what stops them being
+    ///   pushed to Health a second time.
+    /// - One range fetch bounds the dedup lookup to the batch's own `[min(start), max(start)]` —
+    ///   not a per-sample fetch (the #33 mistake `ingest` was rewritten to avoid).
+    func ingestBackfill(_ samples: [QuantitySample]) throws -> [QuantitySample] {
+        assert(samples.allSatisfy { !$0.kind.isCumulativeCounter },
+              "ingestBackfill does not support cumulative-counter kinds — pass them to ingest()")
+        let plausible = samples.filter { Self.isPlausible($0) && !$0.kind.isCumulativeCounter }
+        guard !plausible.isEmpty else { return [] }
+
+        let lo = plausible.map(\.start).min()!
+        let hi = plausible.map(\.start).max()!
+        let existingDescriptor = FetchDescriptor<StoredSample>(
+            predicate: #Predicate { $0.start >= lo && $0.start <= hi })
+        var seen = Set(try context.fetch(existingDescriptor).map { Key(kindRaw: $0.kindRaw, start: $0.start) })
+
+        var ingested: [QuantitySample] = []
+        for s in plausible.sorted(by: { $0.start < $1.start }) {
+            let key = Key(kindRaw: s.kind.rawValue, start: s.start)
+            guard seen.insert(key).inserted else { continue }
+            context.insert(StoredSample(s))
+            ingested.append(s)
+        }
+        guard !ingested.isEmpty else { return [] }
+
+        do {
+            try context.save()
+        } catch {
+            context.rollback()
+            throw error
+        }
+        return ingested
+    }
+
+    /// Identity key for `ingestBackfill`'s dedup — deliberately NOT `Date` alone, since two
+    /// different metric kinds legitimately share a `start` instant.
+    private struct Key: Hashable {
+        let kindRaw: String
+        let start: Date
+    }
+
     /// Single ingest choke point for sample plausibility, checked BEFORE the SyncCursor — see the
     /// ordering note in `ingest`. Two independent gates:
     /// - TIMESTAMP: reject any sample whose `start` predates the ring's own counter epoch

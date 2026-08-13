@@ -184,10 +184,10 @@ public enum HRZoneClassifier {
         return WorkoutZoneBreakdown(secondsInZone: seconds)
     }
 
-    /// Default cap for a single reading's held interval (seconds). The sport stream lands ~every 10 s,
-    /// so 30 s absorbs a missed reading or jitter while refusing to invent zone time across a genuine
-    /// dropout (ring off-wrist / lost link).
-    public static let defaultHoldCapSeconds: Double = 30
+    /// Default cap for a single reading's held interval (seconds). Alias of
+    /// `HRSampleSpan.defaultHoldCapSeconds` — kept so no existing call site outside this file
+    /// needs to change; the value lives in one place.
+    public static let defaultHoldCapSeconds: Double = HRSampleSpan.defaultHoldCapSeconds
 
     /// Time-in-zone using STEP-FUNCTION (last-value-held) attribution — the fix for zone totals reading
     /// far short of the workout (e.g. 0:50 for a 5:05 ride). The ring reports HR PERIODICALLY (~every
@@ -199,7 +199,11 @@ public enum HRZoneClassifier {
     /// dropout is never fabricated into zone time — the total stays honest: ≈ the workout duration when
     /// HR is continuous, and legitimately less when readings were actually missed. Time before the
     /// first reading is not attributed (no zone is assumed before any data). Sub-50%-maxHR readings
-    /// contribute no zone time. Samples are sorted by start; pure and unit-testable.
+    /// contribute no zone time.
+    ///
+    /// Built on `HRSampleSpan.heldForward` — the SAME primitive `WorkoutSessionAggregator.persistableSamples`
+    /// uses to correct what gets PERSISTED, so the live zone display and the stored spans can never
+    /// disagree with each other.
     public static func timeInZonesHeld(
         hrSamples: [HRSample],
         maxHR: Int,
@@ -208,14 +212,60 @@ public enum HRZoneClassifier {
     ) -> WorkoutZoneBreakdown {
         var seconds = [HRZone: Double]()
         for z in HRZone.allCases { seconds[z] = 0 }
-        let sorted = hrSamples.sorted { $0.start < $1.start }
+        for span in HRSampleSpan.heldForward(hrSamples, sessionEnd: sessionEnd, maxGapSeconds: maxGapSeconds) {
+            guard let zone = zone(bpm: span.bpm, maxHR: maxHR) else { continue }
+            seconds[zone, default: 0] += span.end.timeIntervalSince(span.start)
+        }
+        return WorkoutZoneBreakdown(secondsInZone: seconds)
+    }
+}
+
+// MARK: - Held-forward span correction
+
+/// Shared primitive: correct a periodic reading's span to the interval it actually covers, by
+/// holding it forward until the next reading arrives (capped, so a real dropout is never
+/// fabricated into covered time). Extracted so `HRZoneClassifier.timeInZonesHeld` (the live
+/// zone display) and `WorkoutSessionAggregator.persistableSamples` (what gets written to
+/// `LocalStore`) can never drift apart — both are defined in terms of this.
+public enum HRSampleSpan {
+
+    /// Default cap for a single reading's held span (seconds). The sport stream lands ~every
+    /// 10 s, so 30 s absorbs a missed reading or jitter while refusing to invent time across a
+    /// genuine dropout (ring off-wrist / lost link).
+    public static let defaultHoldCapSeconds: Double = 30
+
+    /// Rewrite each sample's `end` to the interval it actually covers: held until the NEXT
+    /// sample's `start` (samples sorted ascending first), the LAST sample held until
+    /// `sessionEnd`. Every span is CAPPED at `maxGapSeconds` so a real dropout is never
+    /// fabricated into covered time. `start` and `bpm` are never altered — nothing is
+    /// interpolated or invented, only re-measured against the readings that actually arrived.
+    ///
+    /// A sample whose held span would be zero-width — an exact-duplicate `start` (the later
+    /// sample of a tie loses its 0-width interval to the earlier, matching how a duplicate was
+    /// already silently dropped by the pre-refactor `guard held > 0`), or a `start` at/after
+    /// `sessionEnd` (clock skew) — is DROPPED from the result entirely. This matters beyond zone
+    /// totals: if this fed a PERSISTED sample, a zero-width one would look like a POINT sample to
+    /// `ExerciseMinutes.elevatedPieces`, which could then widen it to a full epoch under its
+    /// ambient-run heuristic — silently reintroducing fabricated time through a different door.
+    ///
+    /// Pure and unit-testable; result is ascending by `start`, non-overlapping, and never
+    /// extends past `sessionEnd`.
+    public static func heldForward(
+        _ samples: [HRSample],
+        sessionEnd: Date,
+        maxGapSeconds: Double = defaultHoldCapSeconds
+    ) -> [HRSample] {
+        let sorted = samples.sorted { $0.start < $1.start }
+        var out: [HRSample] = []
+        out.reserveCapacity(sorted.count)
         for (i, sample) in sorted.enumerated() {
             let nextAnchor = (i + 1 < sorted.count) ? sorted[i + 1].start : sessionEnd
             let held = min(max(nextAnchor.timeIntervalSince(sample.start), 0), maxGapSeconds)
-            guard held > 0, let zone = zone(bpm: sample.bpm, maxHR: maxHR) else { continue }
-            seconds[zone, default: 0] += held
+            guard held > 0 else { continue }
+            out.append(HRSample(bpm: sample.bpm, start: sample.start,
+                                end: sample.start.addingTimeInterval(held)))
         }
-        return WorkoutZoneBreakdown(secondsInZone: seconds)
+        return out
     }
 }
 
@@ -437,8 +487,34 @@ public final class WorkoutSessionAggregator: @unchecked Sendable {
         )
     }
 
-    /// All samples collected so far (for HealthKit HR series write).
+    /// All samples collected so far (for HealthKit HR series write). RAW as-captured stamps —
+    /// this is what `writeWorkout` hands to `HKWorkoutBuilder`, a path already verified correct
+    /// on-device, so it is deliberately left untouched by the held-forward correction below.
     public var collectedSamples: [HRSample] { samples }
+
+    /// Session readings with spans corrected to the interval each actually covers — for
+    /// PERSISTENCE to `LocalStore`, NOT for the HealthKit write (see `collectedSamples`).
+    ///
+    /// `collectHRSnapshot` stamps every live reading with a fixed ~2 s span (the poll-lock
+    /// window), even though the ring's native sport stream actually reports HR roughly every
+    /// 10 s. `ExerciseMinutes.elevatedPieces` trusts a spanned (`end > start`) sample's own
+    /// duration verbatim — correct for a bulk sleep epoch, whose stamped ~150 s span IS the real
+    /// epoch width, but wrong here: it prices only the 2 s stamp, so a workout's active-kcal on
+    /// the Activity card reads roughly 5x low (2 s of every true ~10 s). Verified on real device
+    /// data: a 38.5-min ride recorded 290 kcal via `writeWorkout`/HealthKit but only 58 kcal
+    /// reached the card (2026-08-12).
+    ///
+    /// This makes the `dur > 0` trust contract true for workout samples the same way it is
+    /// already true for bulk sleep epochs, by using the SAME held-forward, capped-at-dropout
+    /// algorithm `timeInZonesHeld` already applies correctly to the LIVE zone display — that
+    /// display was just never what got persisted. `HRSampleSpan.heldForward` is the shared
+    /// primitive `timeInZonesHeld` is now defined in terms of, so the two can never disagree.
+    public func persistableSamples(
+        sessionEnd: Date,
+        maxGapSeconds: Double = HRSampleSpan.defaultHoldCapSeconds
+    ) -> [HRSample] {
+        HRSampleSpan.heldForward(samples, sessionEnd: sessionEnd, maxGapSeconds: maxGapSeconds)
+    }
 
     // MARK: Live snapshot (for the in-progress Live Activity / UI)
 

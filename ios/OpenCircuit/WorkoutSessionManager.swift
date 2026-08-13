@@ -412,42 +412,67 @@ final class WorkoutSessionManager: NSObject {
         // sync writes to. These samples carry REAL start/end spans (unlike the zero-duration point
         // samples live-monitoring/history-sync persist elsewhere), so GoalsCardView's
         // ExerciseMinutes estimate can credit them directly without needing two elevated point
-        // samples within one epoch of each other. `ingest` is cursor-gated, so re-running a workout
-        // (or this code path firing twice) can't double-count.
+        // samples within one epoch of each other.
         //
-        // ORDERING (double-count guard): this ingest MUST run AFTER `writeWorkout` returns — i.e.
-        // after the workout's active-energy credit is banked via `recordWorkoutActiveKcal` — and in
-        // this suspension-free stretch. `endWorkoutHR()` above flipped `monitoring` false, which
-        // fires ContentView's `flushHealth()`. That flush computes the day's active-energy delta
-        // from LocalStore HR. If we ingested the workout HR BEFORE the credit was banked, a flush
-        // could observe the workout HR with `workoutActiveKcalCredited == 0`, write the workout's
-        // TRIMP kcal as the daily active-energy delta AND let the workout's own `activeEnergyBurned`
-        // sample land too — a permanent, unretractable double-count. Ingesting only now guarantees
-        // any flush that sees the workout HR also sees the banked credit and nets it out.
+        // `ingestBackfill`, NOT `ingest` (2026-08-12 fix): `ingest`'s SyncCursor dedups by
+        // recency ("newer than the last thing I stored"), which is wrong for a backfill that runs
+        // deliberately LATE (see the ordering note below) — by the time it runs, ordinary live-HR
+        // spot reads taken DURING the workout have already advanced the `heartRate` watermark past
+        // the workout's own samples, so `ingest` would read every one of them as stale and drop the
+        // entire workout silently. `ingestBackfill` dedups by IDENTITY (`kind` + `start`) instead,
+        // so it's immune to that and re-running a workout (or this code path firing twice) still
+        // can't double-count — it just re-inserts nothing.
         //
-        // The guard holds PER CHUNK. We split the ingest into small LOSSLESS sub-batches below —
-        // each `store.ingest(...)` is a single `context.save()`, so a one-shot ingest of the whole
-        // workout's HR invalidated EVERY `@Query[StoredSample]` (Calories/Goals/Vitals cards) at
-        // once and the dashboard `List` re-fetched + re-laid-out all of it synchronously on the
-        // main thread — >10 s → the FRONTBOARD `0x8BADF00D` scene-update-watchdog SIGKILL a user hit
-        // when backgrounding right after a long workout summary. Two-part fix: (1) chunking makes
-        // each save a SMALL @Query invalidation, and a short `Task.sleep` between saves gives the
-        // runloop a real turn so no single scene-update exceeds the watchdog budget; (2) the actual
-        // confirmed stall in the crash trace was the READER side — those three cards' per-card
-        // baseline/kcal analytics now run OFF the main actor (`.task` → `Task.detached`, see
-        // CaloriesCardView / GoalsCardView / VitalsStatusCardView), so a re-fetch during a
-        // background scene-update snapshot no longer drags the O(n) math onto the main thread.
-        // Every chunk still runs AFTER the banked active-energy credit, so a `flushHealth()` that
-        // lands between chunks still nets out exactly as the single-shot ingest did.
+        // ORDERING (HealthKit double-count guard — unrelated to the ingest dedup above, and still
+        // required): this backfill MUST run AFTER `writeWorkout` returns — i.e. after the workout's
+        // active-energy credit is banked via `recordWorkoutActiveKcal` — and in this
+        // suspension-free stretch. `endWorkoutHR()` above flipped `monitoring` false, which fires
+        // ContentView's `flushHealth()`. That flush computes the day's active-energy delta from
+        // LocalStore HR. If we ingested the workout HR BEFORE the credit was banked, a flush could
+        // observe the workout HR with `workoutActiveKcalCredited == 0`, write the workout's TRIMP
+        // kcal as the daily active-energy delta AND let the workout's own `activeEnergyBurned`
+        // sample land too — a permanent, unretractable double-count in Apple Health. Ingesting only
+        // now guarantees any flush that sees the workout HR also sees the banked credit and nets it
+        // out. (This is exactly why the samples arrive "late" enough to defeat a recency-based
+        // cursor above — the two constraints pull in opposite directions, which is the bug.)
+        //
+        // The chunking below is independent of both concerns above. We split the ingest into small
+        // sub-batches — each `store.ingestBackfill(...)` is a single `context.save()`, so a
+        // one-shot ingest of the whole workout's HR invalidated EVERY `@Query[StoredSample]`
+        // (Calories/Goals/Vitals cards) at once and the dashboard `List` re-fetched +
+        // re-laid-out all of it synchronously on the main thread — >10 s → the FRONTBOARD
+        // `0x8BADF00D` scene-update-watchdog SIGKILL a user hit when backgrounding right after a
+        // long workout summary. Two-part fix: (1) chunking makes each save a SMALL @Query
+        // invalidation, and a short `Task.sleep` between saves gives the runloop a real turn so no
+        // single scene-update exceeds the watchdog budget; (2) the actual confirmed stall in the
+        // crash trace was the READER side — those three cards' per-card baseline/kcal analytics now
+        // run OFF the main actor (`.task` → `Task.detached`, see CaloriesCardView / GoalsCardView /
+        // VitalsStatusCardView), so a re-fetch during a background scene-update snapshot no longer
+        // drags the O(n) math onto the main thread. Every chunk still runs AFTER the banked
+        // active-energy credit, so a `flushHealth()` that lands between chunks still nets out
+        // exactly as a single-shot ingest would.
         if let store {
-            // Sort ascending by `start` BEFORE chunking so the forward-only SyncCursor
-            // (`selectNew` keeps `start > watermark`, strictly) advances monotonically and never
-            // discards a later chunk. The chunks are disjoint and together cover EVERY sample, and
-            // each boundary is extended to swallow any equal-`start` run at its tail (see below), so
-            // the total StoredSample rows are identical to the old single `store.ingest(toIngest)` —
-            // lossless, nothing dropped or deduped away.
-            let sorted = agg.collectedSamples.sorted { $0.start < $1.start }
-            let toIngest = sorted.map {
+            // Held-forward spans (2026-08-12 fix), NOT the raw ~2 s poll-lock stamp: each reading
+            // covers the interval until the next reading arrives, capped at 30 s so a dropout is
+            // never fabricated — see `WorkoutSessionAggregator.persistableSamples` /
+            // `HRSampleSpan.heldForward`. The raw 2 s stamp is only 20% of the ring's true ~10 s
+            // sport-mode cadence; `ExerciseMinutes.elevatedPieces` trusts a spanned sample's own
+            // duration verbatim, so persisting the raw stamp priced a workout's active-kcal on the
+            // Activity card at roughly 1/5 of its true value (58 kcal vs. 290 kcal HealthKit/the
+            // workout summary recorded for the same 38.5-min ride). `collectedSamples` (raw) still
+            // feeds `writeWorkout` above, unaffected — this correction is for LocalStore only.
+            //
+            // Corrected ONCE over the WHOLE session here, before chunking: `sessionEnd` (`endDate`)
+            // is a property of the session, not of a chunk — computing this per chunk would end
+            // every chunk's last sample at `endDate` instead of at the next chunk's first sample.
+            // Already ascending by `start`, so no separate sort is needed. `ingestBackfill` dedups
+            // by (kind, start) identity rather than a forward-only watermark, so — unlike `ingest`
+            // — chunk order and equal-`start` runs straddling a chunk boundary can no longer drop a
+            // sample; each chunk's own range fetch sees every row a prior chunk already committed.
+            // The equal-`start` boundary-extension below is therefore no longer LOAD-BEARING, only
+            // harmless; left as-is rather than removed as part of this fix.
+            let corrected = agg.persistableSamples(sessionEnd: endDate)
+            let toIngest = corrected.map {
                 QuantitySample(kind: .heartRate, start: $0.start, end: $0.end, value: Double($0.bpm))
             }
             // PARTIAL-WRITE HARDENING (review MF3): the crash scenario this fixes IS "user
@@ -455,9 +480,11 @@ final class WorkoutSessionManager: NSObject {
             // leaves the foreground. Without a background-task assertion iOS can suspend the app
             // mid-loop and only a PREFIX of the workout HR would reach LocalStore — a bounded local
             // active-kcal/exercise-min under-count (HealthKit already has EVERY sample from
-            // `writeWorkout` above; this only keeps the LOCAL estimate whole, and the cursor guard
-            // still prevents any double-count). The loop is ~1–2 s of wall time, far under the
-            // background budget, and self-ends via `defer` / the expiration handler.
+            // `writeWorkout` above; this only keeps the LOCAL estimate whole, and re-running the
+            // ingest picks up exactly where it left off — `ingestBackfill`'s identity dedup means a
+            // retried chunk that partially landed can't double-count). The loop is ~1–2 s of wall
+            // time, far under the background budget, and self-ends via `defer` / the expiration
+            // handler.
             var bgTask: UIBackgroundTaskIdentifier = .invalid
             bgTask = UIApplication.shared.beginBackgroundTask(withName: "oc.workout-hr-ingest") {
                 if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid }
@@ -466,16 +493,15 @@ final class WorkoutSessionManager: NSObject {
 
             let chunkSize = 64
             var i = 0
+            var insertedCount = 0
             while i < toIngest.count {
                 var end = min(i + chunkSize, toIngest.count)
-                // Never split an equal-`start` run across a boundary: once the head sample advances
-                // the cursor watermark to that instant, `selectNew`'s strict `start > watermark`
-                // would drop the tail sample in the next chunk. Extend to swallow the whole run so
-                // chunking stays byte-for-byte lossless vs. the single-batch ingest.
+                // No longer load-bearing under identity dedup (see the note above) — kept as a
+                // harmless no-op grouping rather than removed as part of this fix.
                 while end < toIngest.count && toIngest[end].start == toIngest[end - 1].start {
                     end += 1
                 }
-                _ = try? store.ingest(Array(toIngest[i..<end]))
+                insertedCount += (try? store.ingestBackfill(Array(toIngest[i..<end])))?.count ?? 0
                 i = end
                 // Give the runloop a real turn between saves (review MF1). A bare `Task.yield()`
                 // reschedules on the SAME main-actor executor and can resume WITHOUT CFRunLoop
@@ -487,6 +513,14 @@ final class WorkoutSessionManager: NSObject {
                 // session is a handful of chunks.
                 try? await Task.sleep(for: .milliseconds(20))
             }
+            // Makes a wholly-discarded backfill visible instead of silent (2026-08-12 fix): the
+            // prior cursor-gated `ingest` could drop an entire workout's HR with nothing in any log
+            // to show it — indistinguishable from a successful ingest until someone compared the
+            // Activity card against Apple Health by hand.
+            ObservabilityStore().recordMetricEvent(
+                source: "workout-hr-backfill",
+                detail: "collected=\(toIngest.count) inserted=\(insertedCount) "
+                    + "dup=\(toIngest.count - insertedCount)")
         }
 
         recordingState = .finished(summary: summary)

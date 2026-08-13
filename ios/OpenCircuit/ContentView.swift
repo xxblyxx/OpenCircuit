@@ -163,6 +163,11 @@ struct ContentView: View {
                 OnboardingView { onboardingCompleted = true }
             }
             .task {
+                // Skip under XCTest (2026-08-12) — see `OpenCircuitApp.isRunningUnitTests`. This
+                // block's HealthKit flush and ring-session wiring are exactly the kind of
+                // real-hardware startup work a unit test host has no business doing, and running
+                // it anyway is what made `OpenCircuitTests` unable to launch at all.
+                guard !OpenCircuitApp.isRunningUnitTests else { return }
                 // Register the headache-feature defaults once per launch, so a raw
                 // `UserDefaults.bool(forKey:)`/`integer(forKey:)` read outside an `@AppStorage`
                 // wrapper (the Diagnostics export, and Phase 2's gate bookkeeping) sees the
