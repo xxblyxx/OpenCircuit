@@ -221,6 +221,47 @@ struct HealthNotificationCenter {
                 .map { SpO2Reading(percent: Int(($0.value * 100).rounded()), time: $0.start) }
         }
 
+        // --- De-duplicate by device timestamp ----------------------------------------------------
+        // ⚠️ THE TWO SOURCES ABOVE OVERLAP, AND THE SpO2 RULE IS NOT DUPLICATE-SAFE.
+        // `RingSession.commitDrainedRecords` calls `persist(historySamples)` BEFORE this pass runs,
+        // and clears `historySamples` only when the NEXT drain starts — so on every post-drain
+        // evaluation each freshly-synced reading appears TWICE: once from `recentSamples` and once
+        // from the in-memory batch. That was harmless when the rules were pure `min`/`max`, but the
+        // corroboration rule COUNTS readings: a duplicated corroborator inflates `run`, and a
+        // duplicated bad epoch inflates the `badEpochs / resolved` fraction. A single moving epoch
+        // counted twice turns 1-of-2 (fires) into 2-of-3 (`.badEpochMajority`, suppressed), making
+        // whether a genuine desaturation alerts depend on sync timing. It also inflates `runSize`
+        // and the epoch counts in every log row and export.
+        //
+        // Keyed on whole-second device time, the epoch counter's own granularity. Duplicates are
+        // byte-identical in practice (both copies derive from the same decoded record), so keeping
+        // the first is arbitrary but safe. Applied to HR as well for consistency: it is provably a
+        // no-op there — `highHR` takes a max, and `elevatedHRInactive`'s run span is measured from
+        // first to last timestamp, which exact duplicates cannot move.
+        hr = Self.deduplicatedByTime(hr, key: \.start)
+        spo2 = Self.deduplicatedByTime(spo2, key: \.time)
+
+        // --- Attach per-epoch QUALITY EVIDENCE to each SpO2 reading -----------------------------
+        // Only pay for it when something actually crosses: on an ordinary pass this is a no-op,
+        // and on a crossing it is one UserDefaults read plus a linear decode of ~17 KB per ring.
+        //
+        // ⚠️ THE ORDERING INVARIANT THAT MAKES THIS SOUND, stated here because it is not visible
+        // from either file alone: in `RingSession.commitDrainedRecords` the archive merge happens
+        // BEFORE `historySamples` is assigned, and the alert pass runs after `finalizeSync()`.
+        // So every record behind a `historySamples` SpO2 sample is already in the PERSISTED
+        // archive by the time we look it up here. `bankUnattributedRecords` and
+        // `flushDrainedToArchive` merge ahead of persisting samples too — the same safe direction.
+        if thresholds.lowSpO2Enabled,
+           spo2.contains(where: { $0.percent > 0 && $0.percent <= thresholds.lowSpO2Percent }) {
+            let index = Self.spo2EvidenceIndex(session: session)
+            if !index.isEmpty {
+                spo2 = spo2.map {
+                    SpO2Reading(percent: $0.percent, time: $0.time,
+                                evidence: SpO2EvidenceIndex.lookup(index, at: $0.time))
+                }
+            }
+        }
+
         // --- #144: activity gate for the HR rules ------------------------------------------------
         // Exercise HR routinely crosses 120 bpm, so the raw high-HR / elevated-while-inactive rules
         // would fire a false "high heart rate" alarm after every workout. Gate them on concurrent
@@ -243,12 +284,20 @@ struct HealthNotificationCenter {
         // Both the instantaneous high-HR and the sustained-while-inactive rule read the non-exercising
         // series over the same wide window; the evaluator's own `lastFired` filter gives once-per-event
         // de-dupe. SpO2 (`spo2`) is passed unfiltered — its rule is unaffected by the activity gate.
-        for hit in HealthAlertEvaluator.evaluate(hr: nonExercisingHR, spo2: spo2,
-                                                 inactiveHR: nonExercisingHR,
-                                                 thresholds: thresholds,
-                                                 lastFired: lastFired) {
+        let outcome = HealthAlertEvaluator.evaluate(hr: nonExercisingHR, spo2: spo2,
+                                                    inactiveHR: nonExercisingHR,
+                                                    thresholds: thresholds,
+                                                    lastFired: lastFired)
+        for hit in outcome.hits {
             candidates.append(hit.notification)
             hitByNotif[hit.notification] = hit
+        }
+        // A SUPPRESSED low-SpO2 crossing produces no candidate, so it would vanish without this —
+        // and "we withheld an alert" is the one thing this log exists to make visible. Recorded
+        // here, next to the decision, rather than in the routing block below which only ever sees
+        // things that became candidates.
+        if outcome.spo2.outcome != .noCandidate && !outcome.spo2.fired {
+            Self.recordSuppressedSpO2(outcome.spo2, now: now)
         }
 
         // Read the per-night / per-day ledger ONCE. The #85 temp family and the #183 morning verdict
@@ -300,6 +349,14 @@ struct HealthNotificationCenter {
         // --- Route survivors through the ONE shared gate (quiet hours + backoff) ---------------
         let quiet = HealthAlertDefaults.quietHours()
         let fire = gate.filter(candidates, now: now, lastFired: lastFired, quietHours: quiet)
+        // Record EVERY decision this pass reached — fired AND gated — BEFORE acting on any of
+        // it, and before the `fire.isEmpty` early return below, which would otherwise throw away
+        // the entire "the rule crossed but the gate held it" population. That population is the
+        // interesting one: it is the difference between "the alert never triggered" and "it
+        // triggered and we chose not to tell you", and until now the two were indistinguishable
+        // after the fact. Synchronous, so it cannot land after the `await` suspension below.
+        Self.recordDecisions(candidates: candidates, fired: fire, hits: hitByNotif,
+                             now: now, quiet: quiet, spo2: outcome.spo2)
         guard !fire.isEmpty else { return }
         // Reserve the survivors against the anti-spam backoff SYNCHRONOUSLY — there is no `await`
         // between reading `lastFired` above and this write, so on the main actor a second concurrent
@@ -331,6 +388,103 @@ struct HealthNotificationCenter {
             if let headacheRowDay { try? localStore.markRiskAlerted(day: headacheRowDay) }
         }
         for n in fire { await post(n, hit: hitByNotif[n], signals: headacheSignals) }
+    }
+
+    /// First-wins de-duplication on whole-second device time, preserving input order.
+    private static func deduplicatedByTime<T>(_ items: [T], key: KeyPath<T, Date>) -> [T] {
+        var seen = Set<Int>()
+        return items.filter { seen.insert(Int($0[keyPath: key].timeIntervalSince1970.rounded())).inserted }
+    }
+
+    /// The union of every remembered ring's epoch archive, as an epoch-second → evidence map.
+    ///
+    /// A stored `StoredSample` carries no ring id, so the archive that holds its record cannot be
+    /// known in advance. The ACTIVE ring is seeded first and other rings only fill keys it lacks:
+    /// two rings colliding on the same epoch-second is the corrupted-union hazard `#multi-ring`
+    /// scoped away, and preferring the ring we are actually talking to makes the resolution
+    /// deterministic instead of dictionary-order dependent. Worst case a single evidence row is
+    /// attributed to the wrong ring — never a wrong READING, which comes from the store either way.
+    private static func spo2EvidenceIndex(session: RingSession?) -> [Int: SpO2Evidence] {
+        var index: [Int: SpO2Evidence] = [:]
+        if let session {
+            index = SpO2EvidenceIndex.build(session.epochArchiveStore.load())
+        }
+        var namespaces = RingScanner.rememberedRingIDs
+        // The active ring is already seeded above via its own live `epochArchiveStore` — drop it
+        // here so the loop below doesn't reload and redecode the identical archive bytes under a
+        // second, freshly constructed `EpochArchiveStore` for the same namespace.
+        if let activeID = session?.ringID { namespaces.removeAll { $0 == activeID } }
+        // The pre-multi-ring un-suffixed key, for an install that has not run the legacy
+        // migration yet. Cheap to try and it is the only archive such an install has.
+        namespaces.append("")
+        for ns in namespaces {
+            let records = EpochArchiveStore(namespace: ns).load()
+            guard !records.isEmpty else { continue }
+            for (key, evidence) in SpO2EvidenceIndex.build(records) where index[key] == nil {
+                index[key] = evidence
+            }
+        }
+        return index
+    }
+
+    /// Log a low-SpO2 crossing the rule declined to raise.
+    private static func recordSuppressedSpO2(_ verdict: SpO2Verdict, now: Date) {
+        ObservabilityStore().recordHealthAlert(
+            HealthAlertRecord(date: now,
+                              notification: HealthNotification.lowSpO2.rawValue,
+                              fired: false,
+                              reason: verdict.outcome.rawValue,
+                              value: Double(verdict.reading?.percent ?? 0),
+                              readingTime: verdict.reading?.time,
+                              runSize: verdict.runSize,
+                              evidenceEpochs: verdict.evidenceEpochs,
+                              badEpochs: verdict.badEpochs,
+                              evidenceSummary: verdict.reading?.evidence?.summary))
+    }
+
+    /// Write one `HealthAlertRecord` per candidate this pass produced, fired and gated alike.
+    ///
+    /// The reason strings mirror `NotificationGate.shouldFire`'s own order of checks — quiet
+    /// hours first, then the anti-spam backoff — so a row names the gate that actually stopped
+    /// it rather than a guess. Iteration follows `HealthNotification.allCases`, the same stable
+    /// order `NotificationGate.filter` returns, so the log reads in delivery order.
+    ///
+    /// ⚠️ `fired` here means "the rule passed AND the shared gate allowed it", which is exactly
+    /// what `store.markFired` records a line later — deliberately the same moment, so the log and
+    /// the de-dupe watermark can never disagree about what happened. A later authorization
+    /// failure can still stop delivery; that is a separate condition and is not this flag.
+    private static func recordDecisions(candidates: [HealthNotification],
+                                        fired: [HealthNotification],
+                                        hits: [HealthNotification: HealthAlertHit],
+                                        now: Date,
+                                        quiet: QuietHours,
+                                        spo2: SpO2Verdict) {
+        guard !candidates.isEmpty else { return }
+        let obs = ObservabilityStore()
+        let candidateSet = Set(candidates)
+        let fireSet = Set(fired)
+        for n in HealthNotification.allCases where candidateSet.contains(n) {
+            let didFire = fireSet.contains(n)
+            let reason: String
+            if didFire { reason = "fired" }
+            else if quiet.contains(now) { reason = "gated.quietHours" }
+            else { reason = "gated.backoff" }
+            // The SpO2 row carries its verdict's evidence counts even when it FIRED. A fired row
+            // with `evidenceEpochs == 0` rode the fail-open miss path — the branch whose failure
+            // mode is hardest to reason about, and the one worth seeing the first time it happens.
+            let isSpO2 = n == .lowSpO2
+            obs.recordHealthAlert(HealthAlertRecord(date: now,
+                                                    notification: n.rawValue,
+                                                    fired: didFire,
+                                                    reason: reason,
+                                                    value: hits[n]?.value ?? 0,
+                                                    readingTime: hits[n]?.time,
+                                                    runSize: isSpO2 ? spo2.runSize : 0,
+                                                    evidenceEpochs: isSpO2 ? spo2.evidenceEpochs : 0,
+                                                    badEpochs: isSpO2 ? spo2.badEpochs : 0,
+                                                    evidenceSummary: isSpO2
+                                                        ? spo2.reading?.evidence?.summary : nil))
+        }
     }
 
     /// Whether `n` is one of the #85 skin-temp/fever notifications that de-dupe per night (see

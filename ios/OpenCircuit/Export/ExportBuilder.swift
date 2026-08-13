@@ -347,6 +347,25 @@ enum ExportBuilder {
                 coverage: ArchiveEvidenceCoverage.report(archive: archive, evidence: blobbed))
         }
 
+        // Health-alert decisions in the export window. Filtered on the DECISION time (`date`),
+        // not the reading time, so the rows line up with the sync activity around them — a
+        // decision made today about a reading from last night belongs in today's export.
+        let healthAlertRows: [ExportEngine.HealthAlertRow] = ObservabilityStore()
+            .healthAlertRecords()
+            .filter { $0.date >= from && $0.date < to }
+            .map {
+                ExportEngine.HealthAlertRow(date: $0.date,
+                                            notification: $0.notification,
+                                            fired: $0.fired,
+                                            reason: $0.reason,
+                                            value: $0.value,
+                                            readingTime: $0.readingTime,
+                                            runSize: $0.runSize,
+                                            evidenceEpochs: $0.evidenceEpochs,
+                                            badEpochs: $0.badEpochs,
+                                            evidenceSummary: $0.evidenceSummary)
+            }
+
         // ── v3 sections ───────────────────────────────────────────────────────────────────────
         let meta = metadata(rangeStart: from, rangeEnd: to, now: now)
         let sessionRows = zip(nights, sleepRows).map { night, summary in
@@ -383,11 +402,16 @@ enum ExportBuilder {
                 // stages are our own estimate, that only the average SpO2 is validated, or that
                 // `hrvSDNN` holds RMSSD — while the screen said every section was labelled.
                 "",
-                ExportEngine.provenanceCSV(includesSleepSessions: !sessionRows.isEmpty),
+                ExportEngine.provenanceCSV(includesSleepSessions: !sessionRows.isEmpty,
+                                           includesHealthAlerts: !healthAlertRows.isEmpty),
                 "",
                 ExportEngine.unitsCSV(),
                 "",
-                ExportEngine.notesCSV()
+                ExportEngine.notesCSV(),
+                // Appended at the very END — every section above keeps the index a positional
+                // consumer already relies on (see the file header).
+                "",
+                ExportEngine.healthAlertsCSV(healthAlertRows)
             ].joined(separator: "\n")
         case .json:
             guard let json = ExportEngine.toJSON(samples: sampleRows, sleep: sleepRows,
@@ -399,7 +423,8 @@ enum ExportBuilder {
                                                  now: now,
                                                  metadata: meta,
                                                  sleepSessions: sessionRows,
-                                                 epochArchives: archiveRows) else {
+                                                 epochArchives: archiveRows,
+                                                 healthAlerts: healthAlertRows) else {
                 throw Failure.serializationFailed
             }
             content = json

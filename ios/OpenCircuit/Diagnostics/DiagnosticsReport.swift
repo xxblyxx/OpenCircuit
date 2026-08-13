@@ -130,6 +130,26 @@ enum DiagnosticsReport {
         }
         s.append("")
 
+        // 4b) Health-alert decisions (#73/#85). The one section that reports what the app chose
+        // NOT to tell the wearer. A low-SpO2 rule that suppresses a genuine desaturation and one
+        // that was simply never crossed produce an identical silence everywhere else in this
+        // bundle; only these rows separate them. Suppressed decisions are therefore printed
+        // alongside fired ones, never filtered out.
+        let alertLog = observability.healthAlertRecords().sorted { $0.date > $1.date }
+        s.append("# Health alerts (latest \(min(alertLog.count, 40)) of \(alertLog.count))")
+        if alertLog.isEmpty { s.append("  (no health-alert decisions recorded)") }
+        for r in alertLog.prefix(40) {
+            var line = "  \(t(r.date))  \(r.fired ? "FIRED    " : "suppressed")  \(r.notification)"
+            line += "  reason=\(r.reason)"
+            if r.value > 0 { line += "  value=\(Int(r.value.rounded()))" }
+            if let rt = r.readingTime { line += "  reading=\(t(rt))" }
+            if r.runSize > 0 { line += "  run=\(r.runSize)" }
+            if r.evidenceEpochs > 0 { line += "  bad=\(r.badEpochs)/\(r.evidenceEpochs)" }
+            if let e = r.evidenceSummary { line += "  [\(e)]" }
+            s.append(line)
+        }
+        s.append("")
+
         // 5) Headache signals (#183) — the remote-debugging section for the overnight-signals
         // detector. It exists because the maintainer does not get headaches: TestFlight testers are
         // the ONLY source of ground truth for this feature, and a detector whose inputs are silently

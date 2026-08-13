@@ -84,6 +84,15 @@ final class RingScanner: NSObject {
         set { UserDefaults.standard.set(newValue, forKey: savedPeripheralIDsKey) }
     }
 
+    /// Every ring the user has connected at least once, readable outside the scanner.
+    ///
+    /// Exposed for the health-alert evidence lookup (`HealthNotificationCenter`), which must union
+    /// the per-ring `EpochArchiveStore`s to resolve a stored SpO2 sample back to its raw epoch —
+    /// the sample carries no ring id, so it cannot know in advance which archive holds its record.
+    /// An accessor rather than a copy of the literal: the wear reminder already hardcodes this
+    /// key elsewhere in the app, and a second hardcoded copy is a third place to forget.
+    static var rememberedRingIDs: [String] { savedPeripheralIDs }
+
     /// The ring we auto-reconnect to. Cleared by an explicit user stop so we don't silently
     /// reconnect; the ring stays in `savedPeripheralIDs` so it's still one tap away in the picker.
     private static var activePeripheralID: String? {

@@ -837,6 +837,14 @@ drains **both** every sync; we had hardcoded `0x00`, so we missed everything `0x
   daytime SpO₂ reading** (sleep-vitals layout, `[8]`=SpO₂). **0 % timestamp overlap with `0x00`** —
   genuinely additional data. Decodes with the SAME 23-byte §5.3 schema, e.g. 06-14 ch `0x03`:
   09:52→98 %, 10:12→97 %, 10:42→92 %, 11:02→89 %, 11:22→90 % (waking hours, HR swinging 57–90).
+  🟡 **The "~10 min" cadence above is ONE capture.** A second, MEASURED pass (2026-08-13,
+  `desktop/spo2_alert_autopsy.py` §B, one wearer's real 30 h export, 31 consecutive same-day
+  gaps with a continuous epoch stream across them — off-finger/charging gaps excluded) found it
+  runs considerably wider and more variable: p50 600 s (10 min, consistent with the single
+  capture above), but **p90 1417 s, p99 2325 s, max 2550 s**. Do not size anything that must
+  cover "the daytime SpO₂ gap" — e.g. `HealthAlerts.swift`'s `SpO2AlertPolicy
+  .corroborationWindow` — off the ~10 min headline alone; it undershoots the tail by roughly
+  4×. n=31 from a single ring is not a lot — worth re-measuring as more exports accumulate.
 
 So all-day SpO₂ was on the wire all along — in channel `0x03`, which our `0x00`-only syncs never
 requested. That is the whole cause of "daytime SpO₂ stale for hours" while overnight SpO₂ and on-demand

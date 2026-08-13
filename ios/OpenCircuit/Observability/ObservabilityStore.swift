@@ -34,6 +34,95 @@ struct MetricRecord: Codable, Identifiable, Equatable {
     var detail: String
 }
 
+/// One health-alert DECISION — fired or suppressed — with the reading that drove it.
+///
+/// WHY THIS EXISTS. Before this, the only trace an alert left was `HealthNotificationStore`'s
+/// `alerts.health.lastFired` watermark, which is OVERWRITTEN in place: after a "Low blood oxygen
+/// (80%)" notification you could recover "lowSpO2 last fired at T" and nothing else — not the
+/// value, not the reading's own timestamp, not how many had fired. So "was that a false
+/// positive?" had no denominator, and no change to the rule could be shown to have helped.
+/// This log is that denominator. It records SUPPRESSED decisions too, which is the half that
+/// matters: a suppression rule that silently over-fires is indistinguishable from a working one
+/// unless you can see what it withheld.
+///
+/// ⚠️ EVERY FIELD EXCEPT `date` IS OPTIONAL-TOLERANT AT DECODE TIME, and new ones must be too —
+/// but NOT via a property default alone. `HistorySyncEvidence` learned the underlying lesson (see
+/// `nightRowOutcome` below): a non-optional key missing from old, already-persisted JSON fails
+/// `JSONDecoder` on the WHOLE array, which silently wipes the wearer's log on upgrade.
+///
+/// A property default does NOT prevent that failure — this is a genuine Swift gotcha, not a
+/// stylistic point. Swift's synthesized `Decodable.init(from:)` calls `decode(_:forKey:)` for
+/// every NON-OPTIONAL stored property regardless of whether it has a default value; a default
+/// only affects the synthesized MEMBERWISE initializer, which nothing here calls. Only a truly
+/// `Optional` property gets the lenient `decodeIfPresent` treatment for free (that's why
+/// `readingTime`/`evidenceSummary` below are safe as plain `Optional`s). Everything else needs the
+/// custom `init(from:)` below, which is what actually keeps the promise this comment makes.
+struct HealthAlertRecord: Codable, Identifiable, Equatable {
+    var id = UUID()
+    /// When the decision ran (wall clock), NOT when the reading was taken.
+    var date: Date
+    /// `HealthNotification.rawValue`. Stored as a String, never the enum: the enum's order is
+    /// pinned by `HealthNotificationOrderTests` and its cases may be appended to, so decoding
+    /// an unknown future case must degrade to an unrecognised string rather than fail the array.
+    var notification: String = ""
+    var fired: Bool = false
+    /// Why. `"fired"`, a `SpO2Verdict.Outcome` rawValue once the gated rule lands, or one of
+    /// `"gated.quietHours"` / `"gated.backoff"` when the rule passed but the shared gate held.
+    var reason: String = ""
+    /// Percent for SpO2, bpm for the HR rules. 0 when the decision carried no reading.
+    var value: Double = 0
+    /// The reading's DEVICE timestamp — the thing the notification copy says "detected at".
+    /// Distinct from `date`: a 12 h lookback means these routinely differ by hours, which is
+    /// exactly how "why did this arrive while I was washing dishes?" gets answered.
+    var readingTime: Date?
+    /// Trigger + corroborators. 0 until the corroboration rule lands.
+    var runSize: Int = 0
+    /// How many of the run resolved to a raw 0x4c record, and how many of those were bad.
+    /// `evidenceEpochs == 0` on a FIRED row means the alert rode the fail-open path — worth
+    /// seeing, because that is the branch whose failure mode is hardest to reason about.
+    var evidenceEpochs: Int = 0
+    var badEpochs: Int = 0
+    /// Human-readable one-liner of the epoch evidence, or nil when none resolved.
+    var evidenceSummary: String?
+
+    /// Explicit, since providing `init(from:)` below suppresses Swift's synthesized memberwise
+    /// initializer — this keeps every existing construction call site unchanged.
+    init(id: UUID = UUID(), date: Date, notification: String = "", fired: Bool = false,
+        reason: String = "", value: Double = 0, readingTime: Date? = nil, runSize: Int = 0,
+        evidenceEpochs: Int = 0, badEpochs: Int = 0, evidenceSummary: String? = nil) {
+        self.id = id
+        self.date = date
+        self.notification = notification
+        self.fired = fired
+        self.reason = reason
+        self.value = value
+        self.readingTime = readingTime
+        self.runSize = runSize
+        self.evidenceEpochs = evidenceEpochs
+        self.badEpochs = badEpochs
+        self.evidenceSummary = evidenceSummary
+    }
+
+    /// `decodeIfPresent(...) ?? default` for every field but `date`, which is the one thing every
+    /// row has always genuinely required. `Encodable.encode(to:)` is still synthesized normally —
+    /// only `Decodable` needs to be hand-written, since only decoding old JSON against a widened
+    /// schema is the failure mode this exists to survive.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        date = try c.decode(Date.self, forKey: .date)
+        notification = try c.decodeIfPresent(String.self, forKey: .notification) ?? ""
+        fired = try c.decodeIfPresent(Bool.self, forKey: .fired) ?? false
+        reason = try c.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        value = try c.decodeIfPresent(Double.self, forKey: .value) ?? 0
+        readingTime = try c.decodeIfPresent(Date.self, forKey: .readingTime)
+        runSize = try c.decodeIfPresent(Int.self, forKey: .runSize) ?? 0
+        evidenceEpochs = try c.decodeIfPresent(Int.self, forKey: .evidenceEpochs) ?? 0
+        badEpochs = try c.decodeIfPresent(Int.self, forKey: .badEpochs) ?? 0
+        evidenceSummary = try c.decodeIfPresent(String.self, forKey: .evidenceSummary)
+    }
+}
+
 /// One persisted history-sync evidence bundle. Kept separate from the human-readable activity log:
 /// this is a machine-oriented breadcrumb for "why did sleep not land?" incidents.
 struct HistorySyncEvidence: Codable, Identifiable, Equatable {
@@ -74,6 +163,10 @@ struct ObservabilityStore {
     /// must still cover a few nights back for "did last night sync?" diagnostics.
     static let logLimit = 80
     static let metricLogLimit = 400
+    /// The health-alert decision log. 120 covers roughly a week — matching `ActivityLogView`'s
+    /// default period — because FIRED rows are capped by the 2 h renotify at <=12/day and
+    /// suppressions only occur on a pass that actually had a sub-threshold candidate.
+    static let healthAlertLogLimit = 120
     static let historySyncEvidenceLimit = 24
     static let historySyncEvidenceRetention: TimeInterval = 3 * 24 * 3600
 
@@ -85,6 +178,7 @@ struct ObservabilityStore {
         static let log = "obs.taskLog"
         static let metricLog = "obs.metricLog"
         static let historySyncEvidence = "obs.historySyncEvidence"
+        static let healthAlertLog = "obs.healthAlertLog"
         static let alertFired = "obs.alertLastFired"        // [SyncAlert.rawValue: epoch]
         static let healthEverAuthorized = "obs.healthEverAuthorized"
     }
@@ -182,6 +276,63 @@ struct ObservabilityStore {
         }
         if let data = try? JSONEncoder().encode(rows) {
             defaults.set(data, forKey: Key.historySyncEvidence)
+        }
+    }
+
+    // MARK: Health-alert decision log (#73/#85 body-vital alerts)
+
+    func healthAlertRecords() -> [HealthAlertRecord] {
+        guard let data = defaults.data(forKey: Key.healthAlertLog),
+              let list = try? JSONDecoder().decode([HealthAlertRecord].self, from: data) else { return [] }
+        return list
+    }
+
+    func healthAlertRecords(since cutoff: Date) -> [HealthAlertRecord] {
+        healthAlertRecords().filter { $0.date >= cutoff }
+    }
+
+    /// The instant a decision is de-duplicated against.
+    ///
+    /// ⚠️ FALLS BACK TO THE DECISION'S OWN DAY WHEN THERE IS NO `readingTime`, and that fallback is
+    /// required, not defensive. Only the three #73 HR/SpO2 rules produce a `HealthAlertHit`, so
+    /// only they carry a reading time; the #85 skin-temp/fever family and the #183 morning verdict
+    /// are appended to `candidates` directly and always log with `readingTime == nil`. Keyed on the
+    /// raw optional, every one of those collapses to a single `(notification, reason, nil)` tuple —
+    /// so the FIRST `fever`+`fired` row ever written would block every later fever firing from
+    /// being logged for as long as it survives the buffer, and the log whose whole purpose is to be
+    /// the denominator would show one row per family, ever. Day granularity matches how those
+    /// families already de-dupe (`alerts.health.lastNight`, once per night/day), so it suppresses
+    /// the intended repeat-within-a-pass noise without erasing tomorrow's decision.
+    private static func dedupeKey(_ record: HealthAlertRecord, calendar: Calendar) -> Int {
+        if let reading = record.readingTime {
+            return Int(reading.timeIntervalSince1970.rounded())
+        }
+        return Int(calendar.startOfDay(for: record.date).timeIntervalSince1970.rounded())
+    }
+
+    /// Append a decision, unless an identical one is already on the log.
+    ///
+    /// ⚠️ THE DE-DUPE IS LOAD-BEARING, NOT POLISH. `markFired` only advances the watermark for
+    /// alerts that actually survive the gate, so a SUPPRESSED reading is re-evaluated on every
+    /// subsequent pass until it ages out of the 12 h lookback — several times an hour on a busy
+    /// sync day. Without this the buffer fills with copies of one reading and evicts the week of
+    /// history the log exists to provide. Matching on (notification, readingTime, reason) rather
+    /// than only against the newest row is deliberate: decisions from different families
+    /// interleave, so a newest-row-only check would let the same pair alternate through.
+    /// Reading times are compared at whole-second resolution — the epoch counter's own
+    /// granularity — so a Date round-tripped through JSON can't miss by a float hair.
+    func recordHealthAlert(_ record: HealthAlertRecord, calendar: Calendar = .current) {
+        let existing = healthAlertRecords()
+        let key = Self.dedupeKey(record, calendar: calendar)
+        let duplicate = existing.contains {
+            $0.notification == record.notification
+                && $0.reason == record.reason
+                && Self.dedupeKey($0, calendar: calendar) == key
+        }
+        guard !duplicate else { return }
+        let capped = BoundedLog.appendCapped(record, to: existing, limit: Self.healthAlertLogLimit)
+        if let data = try? JSONEncoder().encode(capped) {
+            defaults.set(data, forKey: Key.healthAlertLog)
         }
     }
 

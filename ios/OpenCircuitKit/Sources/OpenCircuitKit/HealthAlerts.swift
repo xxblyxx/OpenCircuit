@@ -111,7 +111,183 @@ public struct NotificationGate: Equatable, Sendable {
 public struct SpO2Reading: Equatable, Sendable {
     public let percent: Int
     public let time: Date
-    public init(percent: Int, time: Date) { self.percent = percent; self.time = time }
+    /// Quality evidence from the `0x4c` epoch that produced this reading, or nil when no raw
+    /// record resolved (a live on-demand measurement, or a sample older than the archive).
+    /// DEFAULTED so every existing construction site keeps compiling and keeps its old meaning.
+    public let evidence: SpO2Evidence?
+    public init(percent: Int, time: Date, evidence: SpO2Evidence? = nil) {
+        self.percent = percent
+        self.time = time
+        self.evidence = evidence
+    }
+}
+
+/// Policy for the low-SpO2 rule: how much agreement a low reading needs before it may notify,
+/// and how much motion inside the run is tolerated.
+///
+/// WHY A CORROBORATION RULE AT ALL. The shipped rule was a single-sample crossing — one epoch at
+/// or below the threshold notified, with no motion, wear or quality check. That reports an
+/// artifact as a desaturation, and the failure is not hypothetical: an 80 % reading arrived while
+/// the wearer's hands were in water. Optical SpO2 through a wet, moving finger is not a
+/// measurement of blood.
+///
+/// ⚖️ THE SHAPE IS BORROWED, THE CODE IS NOT. No reference project implements low-SpO2 alerting
+/// or artifact rejection (NOOP/Strand has no physiological alert at all; Gadgetbridge only ships a
+/// threshold to watch firmware; GarminDB, open-wearables and fitbit-grafana do display bands and
+/// rollups). Two facts were taken from NOOP/Strand and are cited on the constants below:
+/// `IllnessSignalEngine.minCorroboratingSignals = 2` ("a single noisy night can never raise") and
+/// `MetricArbitrationPolicy`'s SpO2 agreement bound of 2 percentage points. Its off-wrist rule is
+/// FRACTIONAL rather than binary, which is where `maxBadEpochFraction` comes from.
+public struct SpO2AlertPolicy: Equatable, Sendable {
+
+    /// How far from the triggering reading a corroborating reading may sit.
+    ///
+    /// 🟢 MEASURED (2026-08-13, `desktop/spo2_alert_autopsy.py --sweep` against a real 30 h export
+    /// from this wearer's own ring, 153 SpO2-carrying epochs). Confirms the concern this constant
+    /// was provisionally set against:
+    ///
+    /// ⚠️ THIS CONSTANT MUST COVER **TWO** CADENCES AND THEY DIFFER BY AN ORDER OF MAGNITUDE.
+    ///   • channel `0x00`, the sleep program — PROTOCOL.md §5.3, a 🟢 300 s duty cycle. MEASURED
+    ///     here too: n=94, p50=300 s, p99=310 s, max=450 s.
+    ///   • channel `0x03`, all-day — PROTOCOL.md §5.6.1. MEASURED here: n=31, p50=600 s,
+    ///     p90=1417 s, **p99=2325 s, max=2550 s** — wider than the doc's single-capture estimate
+    ///     of 20–30 min (1200–1800 s), which is why this was left provisional rather than frozen
+    ///     against that one capture.
+    /// The reported incident was DAYTIME, so it is on the second, wider regime. Sizing this to the
+    /// 300 s sleep cadence would leave every daytime reading structurally uncorroborated and
+    /// quietly reduce the whole feature to overnight-only — a "fix" that suppresses the false
+    /// alarm by deleting the channel it came from; `HealthAlertsTests
+    /// .testDaytimeCadenceStillCorroborates` pins exactly that trap. 2700 s is the smallest round
+    /// number clearing the measured 2550 s max with margin, on one wearer's data — worth
+    /// re-measuring as more exports accumulate, since n=31 daytime gaps is not a large sample.
+    ///
+    /// Widening this only ever ADDS alerts (more chances to find a corroborator); the suppression
+    /// comes from `agreementTolerance`, not from the window.
+    public var corroborationWindow: TimeInterval
+
+    /// How far apart two readings may be and still be treated as the same event, in percentage
+    /// points. 🟢 SOURCED: NOOP/Strand's `MetricArbitrationPolicy` treats SpO2 sources as agreeing
+    /// within 2 % and conflicting beyond 4 %; the *agreement* bound is the conservative choice for
+    /// a rule whose job is to demand corroboration. Independently, byte `[8]` is an integer
+    /// percent, so 2 points is the smallest tolerance that survives quantisation plus ordinary
+    /// epoch-to-epoch drift. The reported incident (80 % against 96–98 % neighbours) misses by 16.
+    public var agreementTolerance: Int
+
+    /// Readings required before an alert may fire — the trigger plus at least one corroborator.
+    /// 🟢 SOURCED: NOOP/Strand's `IllnessSignalEngine.minCorroboratingSignals = 2`, one time-scale
+    /// down. This is the direct answer to "a single epoch fires the alert today".
+    public var minCorroboratingReadings: Int
+
+    /// The fraction of RESOLVED epochs that may be bad before the run is rejected, applied with a
+    /// STRICT `>` so exactly-half survives.
+    ///
+    /// 🟢 SHAPE SOURCED, threshold reasoned. NOOP/Strand's off-wrist rule drops a candidate run
+    /// only when bad coverage reaches a fraction of its duration — never binary — so a real night
+    /// with a short bad patch survives. The same asymmetry is wanted here, and the strict
+    /// comparison is what delivers it at the minimum run size: 1 bad of 2 is 0.5, NOT `> 0.5`, so
+    /// **one moving epoch inside a genuine run does not kill the alert**. Two bad of two — the
+    /// shape of a hand held in water across both readings — is 1.0 and suppresses. 1 of 3 survives.
+    public var maxBadEpochFraction: Double
+
+    public init(corroborationWindow: TimeInterval = 2700,
+                agreementTolerance: Int = 2,
+                minCorroboratingReadings: Int = 2,
+                maxBadEpochFraction: Double = 0.5) {
+        self.corroborationWindow = corroborationWindow
+        self.agreementTolerance = agreementTolerance
+        self.minCorroboratingReadings = minCorroboratingReadings
+        self.maxBadEpochFraction = maxBadEpochFraction
+    }
+
+    /// Whether ONE epoch is too compromised to count toward a desaturation.
+    ///
+    /// v1 gates on WEAR and INTRA-EPOCH MOTION only, and deliberately no further:
+    ///
+    /// • `unworn` — the idle template is `[4:8] == 05 00 0c 00`, which cannot carry an SpO2 byte
+    ///   at all. Resolving one means something upstream is wrong.
+    /// • `!resolvesStillness` — a step INSIDE the 150 s epoch. `BulkSleep` documents this as
+    ///   exactly the motion component `ActivityPeriod.motionAboveLocalFloor` CANNOT remove: the
+    ///   rolling floor subtracts a per-window LEVEL, so a flat plateau at any level cancels
+    ///   (Gen-2 `01`, Gen-3 `0f`, drifting `16→24→39` alike) while an intra-epoch step survives
+    ///   de-flooring intact. It keys on STRUCTURE, not on a device-dependent level, and reuses the
+    ///   already-calibrated `motionStillThreshold` rather than inventing a number. This mirrors
+    ///   `BulkRecord.measuredHRVRMSSD`, which already gates a recovered value on the ring's own
+    ///   quiet verdict with its justification measured in the doc comment.
+    ///
+    /// NOT gated on, on purpose:
+    /// • `confidence` (byte `[6]`) — 🟢 named but "range ~0…12, not yet bounded precisely" and
+    ///   explicitly "NOT currently consumed by any analytic". PROTOCOL.md §5.3 measured it as the
+    ///   WORST discriminator tested (Mann-Whitney AUC 0.42/0.27 vs wake, against the duty cycle's
+    ///   0.819–1.000). It is carried and logged so the autopsy harness can screen it; baking in an
+    ///   untested weighting ahead of that is what `BulkSleep` warns against.
+    /// • `magnitudesAllZero` — 🟢 MEASURED at 1697/5648 = 30.0 % of corpus records, so its
+    ///   negation flags 70 % of all epochs. As a suppressor it would kill essentially every alert.
+    ///   Carried so a THRESHOLD (rather than the zero test) can be screened later.
+    public func isBadEpoch(_ evidence: SpO2Evidence) -> Bool {
+        evidence.unworn || !evidence.resolvesStillness
+    }
+}
+
+/// The outcome of the low-SpO2 rule, carrying enough context for the health-alert log to say WHY.
+///
+/// A verdict rather than an `SpO2Reading?` on purpose: an optional loses the distinction between
+/// "nothing crossed the threshold" and "something crossed and we chose to withhold it", and that
+/// distinction is the entire point of the change.
+public struct SpO2Verdict: Equatable, Sendable {
+    public enum Outcome: String, Codable, Sendable {
+        /// The rule passed; this alert may fire (subject to the shared quiet-hours/backoff gate).
+        case fired
+        /// Nothing crossed the threshold. Never logged — it is the ordinary case.
+        case noCandidate
+        /// A crossing with no OTHER LOW reading inside the window to corroborate it. Covers both
+        /// "nothing nearby at all" and "nearby readings were all healthy" — in the latter case
+        /// there is nothing that could corroborate a desaturation, so it is the same story.
+        case noCorroboration
+        /// A crossing with another LOW reading nearby that disagrees by more than
+        /// `agreementTolerance` — two sub-threshold readings that are not the same event.
+        case corroborationDisagrees
+        /// Corroborated, but more than `maxBadEpochFraction` of the resolved epochs were moving
+        /// or unworn.
+        case badEpochMajority
+    }
+
+    public let outcome: Outcome
+    /// The worst candidate considered, or nil for `.noCandidate`.
+    public let reading: SpO2Reading?
+    /// Trigger + corroborators.
+    public let runSize: Int
+    /// |Δ%| of the closest in-window reading — the number that makes "disagrees" legible.
+    public let nearestNeighbourDelta: Int?
+    /// How many of the run resolved to a raw record, and how many of those were bad. A FIRED
+    /// verdict with `evidenceEpochs == 0` rode the fail-open path; that is visible on purpose.
+    public let evidenceEpochs: Int
+    public let badEpochs: Int
+
+    public var fired: Bool { outcome == .fired }
+
+    public init(outcome: Outcome, reading: SpO2Reading?, runSize: Int,
+                nearestNeighbourDelta: Int?, evidenceEpochs: Int, badEpochs: Int) {
+        self.outcome = outcome
+        self.reading = reading
+        self.runSize = runSize
+        self.nearestNeighbourDelta = nearestNeighbourDelta
+        self.evidenceEpochs = evidenceEpochs
+        self.badEpochs = badEpochs
+    }
+}
+
+/// The result of one `HealthAlertEvaluator.evaluate` pass.
+///
+/// The SpO2 verdict is returned ALONGSIDE the hits rather than folded into them so a suppression
+/// cannot be silently dropped on the floor — the caller is handed the decision whether or not it
+/// produced a notification.
+public struct HealthAlertOutcome: Equatable, Sendable {
+    public let hits: [HealthAlertHit]
+    public let spo2: SpO2Verdict
+    public init(hits: [HealthAlertHit], spo2: SpO2Verdict) {
+        self.hits = hits
+        self.spo2 = spo2
+    }
 }
 
 /// User-configurable thresholds for the HR/SpO2 alerts (#73). Defaults are conservative and
@@ -184,10 +360,124 @@ public enum HealthAlertEvaluator {
         samples.filter { $0.bpm >= thresholdBpm }.max { $0.bpm < $1.bpm }
     }
 
-    /// The worst (lowest) SpO2 reading at/below the threshold, or nil. "Low blood oxygen detected
-    /// at [time]" (pp.txt:48398).
-    public static func lowSpO2(_ readings: [SpO2Reading], thresholdPercent: Int) -> SpO2Reading? {
-        readings.filter { $0.percent > 0 && $0.percent <= thresholdPercent }.min { $0.percent < $1.percent }
+    /// The low-SpO2 rule: does the worst fresh crossing that CAN corroborate have enough support
+    /// to notify?
+    ///
+    /// ⚠️ THIS REPLACED an ungated `lowSpO2(_:thresholdPercent:) -> SpO2Reading?` that returned the
+    /// minimum reading at or below the threshold and nothing else. That function is deliberately
+    /// NOT kept as a convenience wrapper: an ungated variant sitting next to a gated one is
+    /// precisely how the defect comes back.
+    ///
+    /// `notBefore` is the freshness bound (the caller's `lastFired[.lowSpO2]`), and it applies to
+    /// the TRIGGER ONLY. Corroborators are searched over the FULL series on purpose: a genuine
+    /// multi-epoch run that straddles the bound would otherwise lose its support and be suppressed
+    /// by the very mechanism meant to stop it replaying.
+    ///
+    /// ⚠️ WHY THIS TRIES **EVERY** CANDIDATE, WORST FIRST, NOT JUST THE SINGLE WORST. An earlier
+    /// version picked ONE trigger — the global worst reading in the lookback window — and returned
+    /// whatever that one reading's verdict was, full stop. That silently masks a REAL desaturation:
+    /// if an isolated artifact (no corroborator, e.g. a wet-finger 80 %) happens to be numerically
+    /// worse than a genuine corroborated event elsewhere in the same 12 h window (e.g. an 88/86 %
+    /// pair five minutes apart), the artifact would be chosen as the sole trigger, fail
+    /// corroboration, and the pass would report a suppression for the WHOLE window — the legitimate
+    /// event never gets its own turn at evaluation. Trying candidates worst-first and firing on the
+    /// first one that has real support fixes this without weakening the corroboration requirement:
+    /// each candidate is still judged entirely on its own run. If nothing fires, the worst
+    /// candidate's own verdict is returned, matching the prior single-trigger behaviour exactly —
+    /// so this only changes the outcome when the worst reading fails and a LESS severe one would
+    /// have fired, which is precisely the masking case.
+    public static func lowSpO2(_ readings: [SpO2Reading],
+                               thresholdPercent: Int,
+                               notBefore: Date = .distantPast,
+                               policy: SpO2AlertPolicy = SpO2AlertPolicy()) -> SpO2Verdict {
+        let candidates = readings.filter {
+            $0.percent > 0 && $0.percent <= thresholdPercent && $0.time > notBefore
+        }
+        guard !candidates.isEmpty else {
+            return SpO2Verdict(outcome: .noCandidate, reading: nil, runSize: 0,
+                               nearestNeighbourDelta: nil, evidenceEpochs: 0, badEpochs: 0)
+        }
+
+        var worstVerdict: SpO2Verdict?
+        // Tie-broken on TIME, not left to sort stability. Equal-percent candidates are common
+        // (integer percents), and the input order genuinely varies between passes, so an
+        // unspecified tie-break would let `worstVerdict.reading` — and therefore the logged
+        // `readingTime`, which is part of the decision log's dedupe key — differ pass to pass on
+        // identical data, re-logging the same suppression and evicting real history.
+        for trigger in candidates.sorted(by: { ($0.percent, $0.time) < ($1.percent, $1.time) }) {
+            let verdict = evaluateOne(trigger, readings: readings,
+                                      thresholdPercent: thresholdPercent, policy: policy)
+            if verdict.fired { return verdict }
+            if worstVerdict == nil { worstVerdict = verdict }
+        }
+        // worstVerdict is guaranteed non-nil here: candidates is non-empty, so the loop ran at
+        // least once and captured the first (worst) candidate's verdict before any `return`.
+        return worstVerdict!
+    }
+
+    /// The corroboration + evidence check for ONE candidate trigger. Pulled out of `lowSpO2` so
+    /// that function can try every candidate worst-first without duplicating this logic.
+    private static func evaluateOne(_ trigger: SpO2Reading, readings: [SpO2Reading],
+                                    thresholdPercent: Int, policy: SpO2AlertPolicy) -> SpO2Verdict {
+        let neighbours = readings.filter {
+            $0.time != trigger.time
+                && abs($0.time.timeIntervalSince(trigger.time)) <= policy.corroborationWindow
+        }
+        let nearestDelta = neighbours
+            .min { abs($0.time.timeIntervalSince(trigger.time)) < abs($1.time.timeIntervalSince(trigger.time)) }
+            .map { abs($0.percent - trigger.percent) }
+
+        let corroborators = neighbours.filter {
+            $0.percent <= thresholdPercent && abs($0.percent - trigger.percent) <= policy.agreementTolerance
+        }
+        let run = [trigger] + corroborators
+        guard run.count >= policy.minCorroboratingReadings else {
+            // "Nothing low nearby" and "another low reading that disagrees" are different stories
+            // for the wearer and for whoever tunes the constants, so they get different outcomes.
+            //
+            // ⚠️ The discriminator is whether a nearby reading was ITSELF LOW — not merely whether
+            // any neighbour existed. Keying on `neighbours.isEmpty` mislabels the common case: a
+            // lone low reading surrounded by perfectly healthy ones (the reported dishes incident,
+            // 80 % between 97 % and 96 %) has neighbours, but they are not low readings that
+            // disagree — there is simply nothing to corroborate it. Reporting that as
+            // `.corroborationDisagrees` puts normal readings into the population someone would
+            // later mine to tune `agreementTolerance`, which they have nothing to do with.
+            let lowNeighbours = neighbours.filter { $0.percent <= thresholdPercent }
+            return SpO2Verdict(outcome: lowNeighbours.isEmpty ? .noCorroboration : .corroborationDisagrees,
+                               reading: trigger, runSize: run.count,
+                               nearestNeighbourDelta: nearestDelta,
+                               evidenceEpochs: 0, badEpochs: 0)
+        }
+
+        let resolved = run.compactMap(\.evidence)
+        guard !resolved.isEmpty else {
+            // MISS — no raw record for any reading in the run. FAIL OPEN: corroboration carries it.
+            //
+            // Making a miss fatal would permanently un-alert every live on-demand measurement
+            // (which has no `0x4c` record BY CONSTRUCTION), plus any differently-namespaced ring
+            // and anything after a UserDefaults reset — a silent, unbounded false negative created
+            // by a DIAGNOSTIC detail. The bound that makes fail-open safe: this path is never more
+            // permissive than the rule it replaced, which fired on ONE reading with no evidence at
+            // all. Strictly monotone improvement in every case. `evidenceEpochs == 0` on the
+            // resulting log row is what makes the branch visible the first time it matters.
+            return SpO2Verdict(outcome: .fired, reading: trigger, runSize: run.count,
+                               nearestNeighbourDelta: nearestDelta,
+                               evidenceEpochs: 0, badEpochs: 0)
+        }
+
+        let bad = resolved.filter { policy.isBadEpoch($0) }.count
+        // The denominator is `resolved`, NOT `run`: a partial miss must not dilute the fraction
+        // toward "good". One resolved-and-bad epoch of a 2-run whose other reading missed is 1/1,
+        // and suppresses — "the evidence we have says this was motion" is the coherent reading,
+        // and it is the direction that catches the reported incident when only one epoch resolves.
+        guard Double(bad) <= Double(resolved.count) * policy.maxBadEpochFraction else {
+            return SpO2Verdict(outcome: .badEpochMajority, reading: trigger, runSize: run.count,
+                               nearestNeighbourDelta: nearestDelta,
+                               evidenceEpochs: resolved.count, badEpochs: bad)
+        }
+        return SpO2Verdict(outcome: .fired, reading: trigger, runSize: run.count,
+                           nearestNeighbourDelta: nearestDelta,
+                           evidenceEpochs: resolved.count, badEpochs: bad)
     }
 
     /// The reading that COMPLETES a continuous run of HR ≥ threshold spanning ≥ `minDuration`,
@@ -266,10 +556,10 @@ public enum HealthAlertEvaluator {
     /// is the HR series for the sustained-while-inactive rule; the instantaneous rules use `hr`.
     public static func evaluate(hr: [HRSample], spo2: [SpO2Reading], inactiveHR: [HRSample],
                                 thresholds: HealthAlertThresholds,
-                                lastFired: [HealthNotification: Date] = [:]) -> [HealthAlertHit] {
+                                lastFired: [HealthNotification: Date] = [:],
+                                spo2Policy: SpO2AlertPolicy = SpO2AlertPolicy()) -> HealthAlertOutcome {
         var hits: [HealthAlertHit] = []
         let freshHR = hr.filter { $0.start > (lastFired[.highHR] ?? .distantPast) }
-        let freshSpO2 = spo2.filter { $0.time > (lastFired[.lowSpO2] ?? .distantPast) }
         let freshInactiveHR = inactiveHR.filter {
             $0.start > (lastFired[.elevatedHRInactive] ?? .distantPast)
         }
@@ -277,8 +567,19 @@ public enum HealthAlertEvaluator {
         if thresholds.highHREnabled, let s = highHR(freshHR, thresholdBpm: thresholds.highHRBpm) {
             hits.append(HealthAlertHit(notification: .highHR, value: Double(s.bpm), time: s.start))
         }
-        if thresholds.lowSpO2Enabled, let s = lowSpO2(freshSpO2, thresholdPercent: thresholds.lowSpO2Percent) {
-            hits.append(HealthAlertHit(notification: .lowSpO2, value: Double(s.percent), time: s.time))
+        // NOTE the argument is the FULL `spo2` series, not a pre-filtered fresh one: the rule
+        // applies `notBefore` to the trigger itself and needs the unfiltered series to find
+        // corroborators that may sit before the bound. Pre-filtering here is the bug that would
+        // suppress a genuine run straddling the last-fired watermark.
+        var spo2Verdict = SpO2Verdict(outcome: .noCandidate, reading: nil, runSize: 0,
+                                      nearestNeighbourDelta: nil, evidenceEpochs: 0, badEpochs: 0)
+        if thresholds.lowSpO2Enabled {
+            spo2Verdict = lowSpO2(spo2, thresholdPercent: thresholds.lowSpO2Percent,
+                                  notBefore: lastFired[.lowSpO2] ?? .distantPast,
+                                  policy: spo2Policy)
+            if spo2Verdict.fired, let s = spo2Verdict.reading {
+                hits.append(HealthAlertHit(notification: .lowSpO2, value: Double(s.percent), time: s.time))
+            }
         }
         if thresholds.elevatedHREnabled,
            let s = elevatedHRInactive(freshInactiveHR, thresholdBpm: thresholds.elevatedHRBpm,
@@ -286,7 +587,7 @@ public enum HealthAlertEvaluator {
                                       maxGap: thresholds.elevatedMaxGap) {
             hits.append(HealthAlertHit(notification: .elevatedHRInactive, value: Double(s.bpm), time: s.start))
         }
-        return hits
+        return HealthAlertOutcome(hits: hits, spo2: spo2Verdict)
     }
 }
 

@@ -69,6 +69,7 @@ worth more than the token cost.
 | **Raw vs rollup data modeling** | `refs/GarminDB/garmindb/garmindb/monitoring_db.py` (per-reading) vs `garmin_db.py` (nightly) vs `refs/GarminDB/garmindb/summarydb/summary_base.py` (min/avg/max triad per period). |
 | **Chart perf over long series** | `ChartDownsample` in `refs/noop/Packages/StrandDesign/Sources/StrandDesign/TrendChart.swift` — min/max per bucket, not average, so spikes survive decimation. |
 | **Circadian / by-hour views (#183)** | fitbit-grafana's "Sleep Regularity" and "Hourly walk heatmap" panels — hour-of-day × day-of-week heatmap. Good fit for headache-signal-by-hour. |
+| **Physiological alert design (corroboration, false-positive suppression)** | No project here ships a low-SpO2/high-HR alert — see "Where none of these help" below. The one transferable *pattern* is `refs/noop/Packages/StrandAnalytics/Sources/StrandAnalytics/IllnessSignalEngine.swift`: `minCorroboratingSignals = 2` ("a single noisy night can never raise"), same-day confounder dampening, and a *fractional* (never binary) off-wrist rejection rule. Ported as a pattern, not code, into our low-SpO2 gate (`ios/OpenCircuitKit/Sources/OpenCircuitKit/HealthAlerts.swift`, `SpO2AlertPolicy`). |
 
 ---
 
@@ -384,6 +385,20 @@ reports. Their visual output is not fully characterized here.
   types are all reference for *decisions*, not for code we can lift into SwiftUI.
 - **Strap-class sensing.** WHOOP's raw PPG/ECG buffer work assumes bandwidth and
   sampling a RingConn Gen 2 likely doesn't expose the same way.
+- **SpO2 artifact rejection and physiological threshold alerting.** Surveyed all five
+  specifically for this (2026-08-13, the false low-SpO2-while-washing-dishes fix). **None
+  of them implements it.** NOOP/Strand has no physiological alert of any kind and
+  deliberately refuses to compute a calibrated SpO2 % from raw optical data at all —
+  `spo2Pct` is nulled for every device; only an import ever sets it. Gadgetbridge exposes a
+  low-SpO2 threshold in its UI, but only as a value it forwards to the WATCH's own
+  firmware — the app itself never evaluates it or notifies on it. GarminDB, open-wearables,
+  and fitbit-grafana do display bands and rollups only. The de-facto contract across every
+  non-Swift repo is "zero means no reading, everything else is truth" — none of them
+  reject a reading for motion, poor skin contact, or low perfusion, even where the
+  hardware ships a quality signal (Huami's per-sample `signalQuality` array, Garmin FIT's
+  `reading_confidence` field, Polar's `spo2_quality_average_percent`) — every one of those
+  is parsed and then discarded before persistence. That absence is itself the design input
+  for our fix: see the row above and `HealthAlerts.swift`'s `SpO2AlertPolicy`.
 
 ---
 

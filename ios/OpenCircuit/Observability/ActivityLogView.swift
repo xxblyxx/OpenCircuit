@@ -30,6 +30,7 @@ struct ActivityLogView: View {
     private let store = ObservabilityStore()
     @State private var records: [TaskRecord] = []
     @State private var metricRecords: [MetricRecord] = []
+    @State private var alertRecords: [HealthAlertRecord] = []
     @State private var refreshStatus: UIBackgroundRefreshStatus = .available
     @State private var period: LogPeriod = .week
     @State private var shareItem: URL?
@@ -43,6 +44,11 @@ struct ActivityLogView: View {
     private var filteredMetricRecords: [MetricRecord] {
         guard let cutoff = period.cutoff() else { return metricRecords }
         return metricRecords.filter { $0.date >= cutoff }
+    }
+
+    private var filteredAlertRecords: [HealthAlertRecord] {
+        guard let cutoff = period.cutoff() else { return alertRecords }
+        return alertRecords.filter { $0.date >= cutoff }
     }
 
     /// Decode-sanity warnings worth surfacing here without opening Device Info: a firmware
@@ -121,6 +127,24 @@ struct ActivityLogView: View {
                 }
             }
 
+            // Body-vital alert decisions rank above metric plumbing: this is the only place a
+            // wearer can see that an alert was WITHHELD, which is otherwise indistinguishable
+            // from one that never triggered.
+            Section("Health alerts (\(filteredAlertRecords.count))") {
+                if filteredAlertRecords.isEmpty {
+                    Text(period == .all ? "No health-alert decisions recorded yet."
+                                       : "No health-alert decisions in the last \(period.rawValue).")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(filteredAlertRecords.reversed()) { record in
+                        alertRecordRow(record)
+                    }
+                    Text("Suppressed rows are decisions the app made NOT to notify you. They are "
+                         + "kept so an over-eager filter is as visible as an over-eager alert.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+
             Section("Metric diagnostics (\(filteredMetricRecords.count))") {
                 if filteredMetricRecords.isEmpty {
                     Text(period == .all ? "No metric-level capture diagnostics recorded yet."
@@ -150,6 +174,7 @@ struct ActivityLogView: View {
         .onAppear {
             records = store.records()
             metricRecords = store.metricRecords()
+            alertRecords = store.healthAlertRecords()
             refreshStatus = UIApplication.shared.backgroundRefreshStatus
         }
     }
@@ -167,6 +192,13 @@ struct ActivityLogView: View {
             let icon = r.success ? "✓" : "✗"
             let detail = r.detail.map { " — \($0)" } ?? ""
             lines.append("\(icon) [\(df.string(from: r.date))] \(kindLabel(r.kind))\(detail)")
+        }
+
+        lines.append("")
+        lines.append("--- Health alerts (\(filteredAlertRecords.count)) ---")
+        for r in filteredAlertRecords.reversed() {
+            let icon = r.fired ? "!" : "-"
+            lines.append("\(icon) [\(df.string(from: r.date))] \(alertTitle(r)) — \(alertDetail(r))")
         }
 
         lines.append("")
@@ -218,6 +250,87 @@ struct ActivityLogView: View {
         case .foreground: return "Foreground sync"
         case .cbWake: return "Bluetooth wake"
         case .sleepFocus: return "Sleep Focus sync"
+        }
+    }
+
+    private func alertRecordRow(_ record: HealthAlertRecord) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: record.fired ? "heart.circle.fill" : "bell.slash.fill")
+                .foregroundStyle(record.fired ? .green : .orange)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(alertTitle(record)).font(.subheadline.weight(.medium))
+                    Spacer()
+                    Text(record.date, format: .dateTime.month().day().hour().minute())
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Text(alertDetail(record)).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Human label for a logged decision. Decoded from the stored rawValue, so a row written by
+    /// a future build with a case this one doesn't know still renders (as its raw string) rather
+    /// than disappearing.
+    private func alertTitle(_ record: HealthAlertRecord) -> String {
+        guard let n = HealthNotification(rawValue: record.notification) else {
+            return record.notification
+        }
+        switch n {
+        case .highHR: return "High heart rate"
+        case .lowSpO2: return "Low blood oxygen"
+        case .elevatedHRInactive: return "Elevated heart rate while inactive"
+        case .skinTempRise: return "Skin temperature rise"
+        case .skinTempDrop: return "Skin temperature drop"
+        case .skinTempFluctuationRise: return "Skin temperature fluctuation (rise)"
+        case .skinTempFluctuationDrop: return "Skin temperature fluctuation (drop)"
+        case .fever: return "Suspected fever"
+        case .sedentaryReminder: return "Move reminder"
+        case .wearReminder: return "Wear reminder"
+        case .bedtimeReminder: return "Bedtime reminder"
+        case .chargingComplete: return "Charging complete"
+        case .headacheSigns: return "Overnight signals"
+        }
+    }
+
+    /// One line of "what was decided and on what evidence". Every clause is omitted when its
+    /// input is absent rather than printed as a zero — in this log 0 is a real measured value.
+    /// Built once, not per row: `alertDetail` runs once per visible list row AND once per row in
+    /// `prepareShare`'s export loop, and `DateFormatter` init (locale/calendar setup) is expensive
+    /// enough to be worth hoisting — the same reason `prepareShare` builds its own `df` once
+    /// up front rather than inside its loop.
+    private static let alertReadingTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d HH:mm"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+
+    private func alertDetail(_ record: HealthAlertRecord) -> String {
+        var parts: [String] = [record.fired ? "notified" : "suppressed — \(reasonLabel(record.reason))"]
+        if record.value > 0 {
+            let unit = record.notification == HealthNotification.lowSpO2.rawValue ? "%" : " bpm"
+            parts.append("\(Int(record.value.rounded()))\(unit)")
+        }
+        if let t = record.readingTime {
+            parts.append("reading \(Self.alertReadingTimeFormatter.string(from: t))")
+        }
+        if record.runSize > 0 { parts.append("run \(record.runSize)") }
+        if record.evidenceEpochs > 0 {
+            parts.append("\(record.badEpochs)/\(record.evidenceEpochs) epochs bad")
+        }
+        if let e = record.evidenceSummary { parts.append(e) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func reasonLabel(_ reason: String) -> String {
+        switch reason {
+        case "gated.quietHours": return "quiet hours"
+        case "gated.backoff": return "already alerted recently"
+        case "noCorroboration": return "no second low reading to corroborate it"
+        case "corroborationDisagrees": return "nearby low readings disagree"
+        case "badEpochMajority": return "the ring was moving / not worn"
+        default: return reason
         }
     }
 
