@@ -44,6 +44,17 @@ enum Theme {
     static let stress = adaptive((0.80, 0.23, 0.23), (0.97, 0.46, 0.46))   // stress — red
     static var readiness: Color { accent }                                  // readiness — brand
 
+    // MARK: Sleep-stage palette (#70 Sleep Stages chart)
+    //
+    // Sampled from the RingConn Gen 2 reference screenshot so the hypnogram, its legend, and the
+    // per-stage stat rows can't drift apart. Dark variants are lightened for contrast against the
+    // dark card surface, same rule as the metric palette above.
+
+    static let stageAwake = adaptive((0.79, 0.35, 0.62), (0.93, 0.63, 0.82))   // awake — rose/pink
+    static let stageREM   = adaptive((0.52, 0.48, 0.87), (0.68, 0.65, 0.98))   // REM — periwinkle
+    static let stageLight = adaptive((0.36, 0.30, 0.85), (0.53, 0.47, 0.97))   // light sleep — indigo-blue
+    static let stageDeep  = adaptive((0.14, 0.11, 0.38), (0.31, 0.26, 0.71))   // deep sleep — dark navy
+
     // MARK: Surfaces
 
     /// The page background behind every tab (defers to the grouped background so it tracks light/dark).

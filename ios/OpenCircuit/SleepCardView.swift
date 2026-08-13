@@ -383,6 +383,26 @@ struct SleepCardView: View {
                               ? row.sleepEditCurrentInBedStart...row.sleepEditCurrentWake : nil)
     }
 
+    /// Segments backing the "Sleep Stages" chart: the just-finished sync's live staging when
+    /// present (mirrors how `night` itself resolves live vs. stored), else the persisted
+    /// hypnogram for this night — already decoded and non-throwing (`LocalStore.hypnogram`).
+    private func stageSegments(_ night: Night) -> [SleepSegment] {
+        if !liveSegments.isEmpty { return liveSegments }
+        return LocalStore(modelContext).hypnogram(night: night.nightKey)
+    }
+
+    /// Overnight HR points for the "Sleep HR" overlay, narrowed from the SAME `recentVitals` query
+    /// `overnightAverages` already uses — empty (not an error) once the night has aged out of the
+    /// 3-day window, which disables the toggle rather than drawing an empty line.
+    private func hrPoints(_ night: Night) -> [(Date, Double)] {
+        guard let start = night.inBedStart, let end = night.inBedEnd, end > start else { return [] }
+        let raw = MetricKind.heartRate.rawValue
+        return recentVitals
+            .filter { $0.kindRaw == raw && $0.start >= start && $0.start <= end && $0.value > 0 }
+            .sorted { $0.start < $1.start }
+            .map { ($0.start, $0.value) }
+    }
+
     @ViewBuilder
     private func content(_ night: Night) -> some View {
         let s = night.summary
@@ -405,8 +425,10 @@ struct SleepCardView: View {
             Spacer()
             if let score = latest?.sleepScore, score > 0 { scoreBadge(score) }
         }
-        stageBar(m)
-        stageLegend(m)
+        // Sleep Stages (#70 RingConn clone): timestamped hypnogram + axis + legend + movement
+        // strip + per-stage stat rows, replacing the old proportional bar/legend pair.
+        SleepStagesSection(segments: stageSegments(night), movementLevels: latest?.movementLevels ?? [],
+                          movementWindowStart: night.inBedStart, hrPoints: hrPoints(night), minutes: m)
         // When we actually fell asleep / woke (distinct from the bedtime window) + latency — this is
         // what makes the in-bed-vs-asleep gap legible ("I wasn't asleep yet at 11pm").
         sleepWindowCaption(night)
@@ -491,7 +513,8 @@ struct SleepCardView: View {
     }
 
     /// The Wave-1 sleep-detail rows in one group: per-stage HR, overnight stress, skin-temp
-    /// baseline, movement chart, naps, and the subjective rating.
+    /// baseline, naps, and the subjective rating. The movement chart moved into
+    /// `SleepStagesSection` above (#70 RingConn clone).
     @ViewBuilder
     private func detailSection() -> some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -499,7 +522,6 @@ struct SleepCardView: View {
             stressRow()        // #71 overnight stress
             osaRow()           // #91 sleep-apnea SpO₂ (dense 0x48 assessment)
             skinTempSection()  // #69 nightly skin-temp + baseline offset + mini chart
-            movementSection()  // #70 2.5-min / 3-level movement chart
             napsRow()          // #76 daytime naps
             feelRating()       // #70 subjective rating
         }
@@ -721,70 +743,6 @@ struct SleepCardView: View {
             + "\(abnormal) of \(offsets.count) nights outside the normal band"
     }
 
-    // MARK: Body-movement chart (#70)
-
-    @ViewBuilder
-    private func movementSection() -> some View {
-        let levels = latest?.movementLevels ?? []
-        if !levels.isEmpty {
-            let summary = movementSummary(levels)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Movement").font(.caption2).foregroundStyle(.secondary)
-                // Encode level in BAR HEIGHT as well as colour (still=short, light=mid, active=full)
-                // so the strip is legible in greyscale — yellow-vs-orange is a hard colourblind pair.
-                GeometryReader { geo in
-                    HStack(alignment: .bottom, spacing: 1) {
-                        ForEach(Array(levels.enumerated()), id: \.offset) { _, lvl in
-                            Rectangle().fill(movementColor(lvl))
-                                .frame(width: max(geo.size.width / CGFloat(levels.count) - 1, 0.5),
-                                       height: max(geo.size.height * movementHeightFraction(lvl), 1))
-                        }
-                    }
-                    .frame(maxHeight: .infinity, alignment: .bottom)
-                }
-                .frame(height: 16)
-                .clipShape(RoundedRectangle(cornerRadius: 3))
-                // Text summary for sighted colourblind users (and the VoiceOver value below).
-                Text(summary).font(.caption2).foregroundStyle(.tertiary)
-            }
-            .padding(.top, 2)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Movement")
-            .accessibilityValue(summary)
-        }
-    }
-
-    /// One-line movement summary (dominant level + count of restless runs) shared by the visible
-    /// caption and the VoiceOver value. `levels`: 0=still, 1=light, 2=active (may be a partial night).
-    private func movementSummary(_ levels: [Int]) -> String {
-        let still = levels.filter { $0 == 0 }.count
-        let moving = levels.count - still
-        guard moving > 0 else { return "Still all night" }
-        var runs = 0, inRun = false
-        for l in levels {
-            if l >= 1 { if !inRun { runs += 1; inRun = true } } else { inRun = false }
-        }
-        let lead = still >= moving ? "Mostly still" : "Restless"
-        return "\(lead) · \(runs) restless period\(runs == 1 ? "" : "s")"
-    }
-
-    /// Bar-height fraction per movement level (the non-colour cue): still low, active full.
-    private func movementHeightFraction(_ level: Int) -> CGFloat {
-        switch level {
-        case 2: return 1.0     // active
-        case 1: return 0.65    // light
-        default: return 0.35   // still
-        }
-    }
-
-    private func movementColor(_ level: Int) -> Color {
-        switch level {
-        case 2: return .orange       // active
-        case 1: return .yellow       // light
-        default: return Color.secondary.opacity(0.25)   // still
-        }
-    }
-
     // MARK: Naps (#76)
 
     @ViewBuilder
@@ -955,37 +913,6 @@ struct SleepCardView: View {
         }
     }
 
-    /// Proportional Deep/Light/REM/Awake bar, driven by the night's stage minutes.
-    private func stageBar(_ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> some View {
-        let total = Double(m.deep + m.light + m.rem + m.awake)
-        return GeometryReader { geo in
-            HStack(spacing: 1) {
-                ForEach(Self.stages, id: \.name) { stage in
-                    let mins = stage.minutes(m)
-                    Rectangle().fill(stage.color)
-                        .frame(width: total > 0 ? geo.size.width * Double(mins) / total : 0)
-                }
-            }
-        }
-        .frame(height: 12)
-        .clipShape(Capsule())
-    }
-
-    /// Color key with per-stage minutes (omits stages with no time).
-    private func stageLegend(_ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> some View {
-        HStack(spacing: 12) {
-            ForEach(Self.stages, id: \.name) { stage in
-                let mins = stage.minutes(m)
-                if mins > 0 {
-                    HStack(spacing: 4) {
-                        Circle().fill(stage.color).frame(width: 7, height: 7)
-                        Text("\(stage.name) \(mins)m").font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-    }
-
     /// The actual-sleep clock window + sleep latency, shown as a caption under the stage legend.
     /// Falls back to the in-bed window when the onset/wake aren't recorded (a legacy stored night).
     /// This is the surface that distinguishes "in bed" from "asleep" at a glance.
@@ -1060,21 +987,6 @@ struct SleepCardView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
-
-    // MARK: Stage table
-
-    private struct Stage {
-        let name: String
-        let color: Color
-        let minutes: (_ m: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)) -> Int
-    }
-    /// Display order + colors (match the prior sync-card stage bar): Deep, Light, REM, Awake.
-    private static let stages: [Stage] = [
-        Stage(name: "Deep", color: .indigo, minutes: { $0.deep }),
-        Stage(name: "Light", color: .teal, minutes: { $0.light }),
-        Stage(name: "REM", color: .purple, minutes: { $0.rem }),
-        Stage(name: "Awake", color: .orange, minutes: { $0.awake }),
-    ]
 
     // MARK: Night label
 
