@@ -21,6 +21,10 @@ venv/
 # Scratch
 tmp/
 
+# Reference codebases — read-only clones of other projects (see docs/REFERENCES.md).
+# Recreate with scripts/sync-refs.sh; never commit them into this repo.
+refs/
+
 # OS / editor
 .DS_Store
 Thumbs.db

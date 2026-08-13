@@ -76,6 +76,7 @@ a branch and recommend a branch name. Do not start editing until that's settled.
 | `docs/HEALTHKIT_MAPPING.md` | Each metric → HealthKit type |
 | `docs/BACKGROUND_SYNC.md` | **How the official RingConn app syncs to Apple Health without being opened (RE'd blueprint) → mapped to our BGTask + CoreBluetooth-restoration implementation (#119); deliberate divergences + validation runbook** |
 | `docs/HANDOFF_MACOS_IOS.md` | **Pickup instructions for the iOS work on macOS** |
+| `docs/REFERENCES.md` | **Five related projects cloned to `refs/` for design + troubleshooting (charts, BLE RE, schemas). Read the ⚖️ license rule first, then "if you're working on X, read Y"** |
 | `docs/ROADMAP.md` | Phases + risks |
 | `ios/` | Swift app (Phase 3+, not yet created) |
 
@@ -109,3 +110,21 @@ xcrun devicectl device process launch --device "$DEV" com.bly.opencircuit
 - Captures in `desktop/captures/` are gitignored — they hold real health data. Commit
   decoded *findings* only, never raw captures.
 - Tag every protocol claim 🟢 confirmed / 🟡 probable / 🔴 guess, with its source.
+
+## Reference codebases (`refs/`) — read for FACTS, never copy CODE
+`refs/` holds read-only clones of five other projects we mine for design ideas
+(`scripts/sync-refs.sh` to create/refresh; gitignored). **`docs/REFERENCES.md` maps
+each one to the problem it helps with and names the specific files worth opening** —
+read the index before grepping 200 MB of someone else's source.
+
+- **Two are copyleft (Gadgetbridge AGPL-3.0, GarminDB GPL-2.0) and one is
+  noncommercial (NOOP PolyForm-1.0.0). OpenCircuit is public.** Never copy their code
+  into `ios/` or `desktop/`, and never paraphrase a file closely enough to be a
+  translation. Read it, understand the approach, close it, write ours.
+- **Facts are free** — byte layouts, opcode numbers, checksums, units, schema columns,
+  which chart type suits which metric. Take those, and cite the source.
+- Prefer having a **subagent** read AGPL/PolyForm source and report back in prose: it
+  keeps the implementation out of the main context, where it could otherwise bleed
+  into Swift written later.
+- Facts about *other* devices (e.g. the Colmi R0x rings) are a sanity check only —
+  never promote them into `docs/PROTOCOL.md` as RingConn claims.
