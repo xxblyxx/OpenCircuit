@@ -70,6 +70,7 @@ a branch and recommend a branch name. Do not start editing until that's settled.
 | `docs/RUNBOOK_SLEEP_GROUNDTRUTH.md` | **Capture RingConn's computed hypnogram (`sleepPhases`) via mitmproxy → fit our staging to it** |
 | `docs/RUNBOOK_OSA_APNEA.md` | **OSA sleep-apnea (#91) — capture cracked (start `05 22 01`, dense PPG `0x48`), decode→AHI parked; forward plan** |
 | `desktop/ringconn_sleep_fit.py` | Supervised-fit harness: align our epochs to RingConn `sleepPhases`, fit `SleepStaging.Tuning` (`--synthetic` to demo) |
+| `desktop/device_alert_audit.py` | **Did the shipped alert rule decide correctly?** `--pull` over USB, then re-derives every logged health-alert decision from the phone's own SwiftData samples + raw epoch archive |
 | `docs/HEADACHE_SIGNALS.md` | **Headache signals (#183) — plan of record. Read §1 first: the honest accuracy arithmetic is why the alert must EARN its way on per-user** |
 | `docs/RUNBOOK_HEADACHE_VALIDATION.md` | **On-device validation for #183 (freeze / migration / HealthKit) + the tester-facing "What to Test"** |
 | `docs/WIDGETS_HOME_SCREEN.md` | **Home Screen widgets — plan of record (PROPOSED, not built). Read §1: the App-Group/SwiftData hazard and why a read-only snapshot sidesteps it** |
