@@ -49,6 +49,24 @@ Health** — no cloud, no subscription.
 - Analytics ported **natively to Swift** (no Rust/UniFFI).
 - User has the ring and can capture Android HCI snoop logs.
 
+## Validating what we ship (`docs/PENDING_VALIDATION.md`)
+Some fixes here **cannot be checked when they land** — the ring produces the confirming data
+hours or days later, and some only when the wearer's body does the thing the code watches for.
+That gap is how a fix quietly becomes folklore: carefully reasoned, tests green, never once
+observed working.
+
+- **Shipping something whose correctness rests on data that doesn't exist yet? Add an entry
+  before calling the work done.** The file's table lists the required fields; the load-bearing
+  ones are `needs` (the data event that must occur), `check` (the exact command), `passes-if`
+  (decided *now*, not after seeing the result), and `check-after` (earliest useful date).
+- A `SessionStart` hook (`.claude/settings.json` → `scripts/pending-validation.py`) surfaces
+  ripe entries at the start of every session. When it does: **ask whether to validate now.**
+  Don't start pulling data unprompted, and don't let it displace what the session is for.
+- Validated → move the entry to `## Settled` with what was actually observed. Data still absent
+  → bump `check-after`. Never delete an entry that was never checked.
+- Keep it to **claims awaiting evidence**. It is not a TODO list; general follow-ups go in
+  issues. Once it fills with wishlist items the session-start reminder becomes wallpaper.
+
 ## git branching
 Maintain the integrity of `master` — always create a branch to work from. Before
 implementing any code change, if you are on `master`, ask the user whether to create
@@ -77,6 +95,7 @@ a branch and recommend a branch name. Do not start editing until that's settled.
 | `docs/HEALTHKIT_MAPPING.md` | Each metric → HealthKit type |
 | `docs/BACKGROUND_SYNC.md` | **How the official RingConn app syncs to Apple Health without being opened (RE'd blueprint) → mapped to our BGTask + CoreBluetooth-restoration implementation (#119); deliberate divergences + validation runbook** |
 | `docs/HANDOFF_MACOS_IOS.md` | **Pickup instructions for the iOS work on macOS** |
+| `docs/PENDING_VALIDATION.md` | **Shipped but unconfirmed claims + their check commands. Surfaced at session start by `scripts/pending-validation.py`** |
 | `docs/REFERENCES.md` | **Five related projects cloned to `refs/` for design + troubleshooting (charts, BLE RE, schemas). Read the ⚖️ license rule first, then "if you're working on X, read Y"** |
 | `docs/ROADMAP.md` | Phases + risks |
 | `ios/` | Swift app (Phase 3+, not yet created) |
