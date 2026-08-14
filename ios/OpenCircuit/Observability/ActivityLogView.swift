@@ -36,19 +36,28 @@ struct ActivityLogView: View {
     @State private var shareItem: URL?
     @State private var showShare = false
 
+    /// Rows shown per long-running section before the "Show all" toggle is needed.
+    private static let collapsedRowCount = 5
+    @State private var syncExpanded = false
+    @State private var alertsExpanded = false
+    @State private var metricsExpanded = false
+
+    /// Newest-first, already period-filtered — the order every consumer (list rows and the
+    /// share export) wants. Records are stored oldest-first, so the reverse lives here once
+    /// instead of at every call site.
     private var filteredRecords: [TaskRecord] {
-        guard let cutoff = period.cutoff() else { return records }
-        return records.filter { $0.date >= cutoff }
+        guard let cutoff = period.cutoff() else { return Array(records.reversed()) }
+        return Array(records.filter { $0.date >= cutoff }.reversed())
     }
 
     private var filteredMetricRecords: [MetricRecord] {
-        guard let cutoff = period.cutoff() else { return metricRecords }
-        return metricRecords.filter { $0.date >= cutoff }
+        guard let cutoff = period.cutoff() else { return Array(metricRecords.reversed()) }
+        return Array(metricRecords.filter { $0.date >= cutoff }.reversed())
     }
 
     private var filteredAlertRecords: [HealthAlertRecord] {
-        guard let cutoff = period.cutoff() else { return alertRecords }
-        return alertRecords.filter { $0.date >= cutoff }
+        guard let cutoff = period.cutoff() else { return Array(alertRecords.reversed()) }
+        return Array(alertRecords.filter { $0.date >= cutoff }.reversed())
     }
 
     /// Decode-sanity warnings worth surfacing here without opening Device Info: a firmware
@@ -115,46 +124,46 @@ struct ActivityLogView: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
-            Section("Sync activity (\(filteredRecords.count))") {
+            Section {
                 if filteredRecords.isEmpty {
                     Text(period == .all ? "No background activity recorded yet."
                                        : "No activity in the last \(period.rawValue).")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(filteredRecords.reversed()) { record in
-                        recordRow(record)
-                    }
+                    collapsibleRows(filteredRecords, expanded: $syncExpanded) { recordRow($0) }
                 }
+            } header: {
+                collapsibleHeader("Sync activity", count: filteredRecords.count, expanded: $syncExpanded)
             }
 
             // Body-vital alert decisions rank above metric plumbing: this is the only place a
             // wearer can see that an alert was WITHHELD, which is otherwise indistinguishable
             // from one that never triggered.
-            Section("Health alerts (\(filteredAlertRecords.count))") {
+            Section {
                 if filteredAlertRecords.isEmpty {
                     Text(period == .all ? "No health-alert decisions recorded yet."
                                        : "No health-alert decisions in the last \(period.rawValue).")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(filteredAlertRecords.reversed()) { record in
-                        alertRecordRow(record)
-                    }
+                    collapsibleRows(filteredAlertRecords, expanded: $alertsExpanded) { alertRecordRow($0) }
                     Text("Suppressed rows are decisions the app made NOT to notify you. They are "
                          + "kept so an over-eager filter is as visible as an over-eager alert.")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
+            } header: {
+                collapsibleHeader("Health alerts", count: filteredAlertRecords.count, expanded: $alertsExpanded)
             }
 
-            Section("Metric diagnostics (\(filteredMetricRecords.count))") {
+            Section {
                 if filteredMetricRecords.isEmpty {
                     Text(period == .all ? "No metric-level capture diagnostics recorded yet."
                                        : "No metric events in the last \(period.rawValue).")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(filteredMetricRecords.reversed()) { record in
-                        metricRecordRow(record)
-                    }
+                    collapsibleRows(filteredMetricRecords, expanded: $metricsExpanded) { metricRecordRow($0) }
                 }
+            } header: {
+                collapsibleHeader("Metric diagnostics", count: filteredMetricRecords.count, expanded: $metricsExpanded)
             }
         }
         .navigationTitle("Background activity")
@@ -188,7 +197,7 @@ struct ActivityLogView: View {
                                "Exported: \(df.string(from: Date()))", ""]
 
         lines.append("--- Sync activity (\(filteredRecords.count)) ---")
-        for r in filteredRecords.reversed() {
+        for r in filteredRecords {
             let icon = r.success ? "✓" : "✗"
             let detail = r.detail.map { " — \($0)" } ?? ""
             lines.append("\(icon) [\(df.string(from: r.date))] \(kindLabel(r.kind))\(detail)")
@@ -196,14 +205,14 @@ struct ActivityLogView: View {
 
         lines.append("")
         lines.append("--- Health alerts (\(filteredAlertRecords.count)) ---")
-        for r in filteredAlertRecords.reversed() {
+        for r in filteredAlertRecords {
             let icon = r.fired ? "!" : "-"
             lines.append("\(icon) [\(df.string(from: r.date))] \(alertTitle(r)) — \(alertDetail(r))")
         }
 
         lines.append("")
         lines.append("--- Metric diagnostics (\(filteredMetricRecords.count)) ---")
-        for r in filteredMetricRecords.reversed() {
+        for r in filteredMetricRecords {
             lines.append("[\(df.string(from: r.date))] \(r.source): \(r.detail)")
         }
 
@@ -212,6 +221,54 @@ struct ActivityLogView: View {
         guard (try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)) != nil else { return }
         shareItem = url
         showShare = true
+    }
+
+    /// Section header carrying the same expand/collapse control as the row list's trailing
+    /// button. Lets you collapse a long section from the top without scrolling past it first.
+    /// `Section("string")` styles its header for free (footnote, secondary color); a custom
+    /// header view like this one doesn't inherit that automatically, so it's set explicitly to
+    /// match the plain-string headers used elsewhere on this screen.
+    private func collapsibleHeader(_ title: String, count: Int, expanded: Binding<Bool>) -> some View {
+        HStack {
+            Text("\(title) (\(count))")
+            if count > Self.collapsedRowCount {
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { expanded.wrappedValue.toggle() }
+                } label: {
+                    Image(systemName: expanded.wrappedValue ? "chevron.up" : "chevron.down")
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+    }
+
+    /// Rows for one log section, capped to the newest `collapsedRowCount` until expanded.
+    /// Generic over the record type so Sync / Alerts / Metrics share one collapse behaviour
+    /// instead of tripling the prefix + toggle logic. `items` is expected already sorted in
+    /// display order (newest first) — this only ever trims from the end.
+    @ViewBuilder
+    private func collapsibleRows<Item: Identifiable, Row: View>(
+        _ items: [Item],
+        expanded: Binding<Bool>,
+        @ViewBuilder row: @escaping (Item) -> Row
+    ) -> some View {
+        ForEach(expanded.wrappedValue ? items : Array(items.prefix(Self.collapsedRowCount))) { row($0) }
+        if items.count > Self.collapsedRowCount {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { expanded.wrappedValue.toggle() }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(expanded.wrappedValue ? "Show fewer" : "Show all \(items.count)")
+                    Image(systemName: expanded.wrappedValue ? "chevron.up" : "chevron.down")
+                }
+                .font(.caption.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
+        }
     }
 
     private func timeRow(_ label: String, _ date: Date?) -> some View {
