@@ -172,6 +172,41 @@ public enum ExportEngine {
         }
     }
 
+    /// One health-alert DECISION the app reached — fired or suppressed — with the reading and
+    /// the epoch evidence behind it.
+    ///
+    /// DIAGNOSTIC, not health data: this describes what the APP decided, not what the wearer's
+    /// body did. The reading it names is already in `samples` — suppressing an alert never
+    /// suppresses the measurement. Exported because a suppression rule that silently withholds a
+    /// genuine desaturation and one that was simply never crossed are indistinguishable in every
+    /// other section of this file.
+    public struct HealthAlertRow: Equatable, Sendable {
+        public let date: Date
+        public let notification: String
+        public let fired: Bool
+        public let reason: String
+        public let value: Double
+        public let readingTime: Date?
+        public let runSize: Int
+        public let evidenceEpochs: Int
+        public let badEpochs: Int
+        public let evidenceSummary: String?
+        public init(date: Date, notification: String, fired: Bool, reason: String,
+                    value: Double, readingTime: Date?, runSize: Int,
+                    evidenceEpochs: Int, badEpochs: Int, evidenceSummary: String?) {
+            self.date = date
+            self.notification = notification
+            self.fired = fired
+            self.reason = reason
+            self.value = value
+            self.readingTime = readingTime
+            self.runSize = runSize
+            self.evidenceEpochs = evidenceEpochs
+            self.badEpochs = badEpochs
+            self.evidenceSummary = evidenceSummary
+        }
+    }
+
     // MARK: - Schema v3 row types
 
     /// Fixed string carried in `meta.timestampPolicy`. Verbatim in the file so a consumer never
@@ -699,14 +734,39 @@ public enum ExportEngine {
     // Sorted by key so the CSV rows and the JSON objects (serialized `.sortedKeys`) list in the
     // same order.
 
+    /// CSV for the health-alert decision log. Header below.
+    ///
+    /// Appended at the very END of the CSV section list (see `ExportBuilder`), so every section a
+    /// v2/v3 consumer indexes positionally keeps its index.
+    public static func healthAlertsCSV(_ rows: [HealthAlertRow]) -> String {
+        var lines = ["date,notification,fired,reason,value,readingTime,runSize,evidenceEpochs,badEpochs,evidenceSummary"]
+        for r in rows {
+            lines.append(csvLine([
+                iso8601.string(from: r.date),
+                r.notification,
+                String(r.fired),
+                r.reason,
+                "\(r.value)",
+                r.readingTime.map { iso8601.string(from: $0) } ?? "",
+                "\(r.runSize)",
+                "\(r.evidenceEpochs)",
+                "\(r.badEpochs)",
+                r.evidenceSummary ?? ""
+            ]))
+        }
+        return lines.joined(separator: "\n")
+    }
+
     /// CSV for the provenance map. Header: `section,provenance`.
     ///
     /// The value column is named after the JSON block it mirrors — as `field,unit` mirrors `units`
     /// and `topic,note` mirrors `notes` — so a reader who has only ever seen one of the two views
     /// can join them, and so the word a consumer searches for is in the file.
-    public static func provenanceCSV(includesSleepSessions: Bool) -> String {
+    public static func provenanceCSV(includesSleepSessions: Bool,
+                                     includesHealthAlerts: Bool = false) -> String {
         keyValueCSV(header: "section,provenance",
-                    map: provenance(includesSleepSessions: includesSleepSessions))
+                    map: provenance(includesSleepSessions: includesSleepSessions,
+                                    includesHealthAlerts: includesHealthAlerts))
     }
 
     /// CSV for the units map. Header: `field,unit`.
@@ -769,7 +829,8 @@ public enum ExportEngine {
                               now: Date = Date(),
                               metadata: ExportMetadata? = nil,
                               sleepSessions: [SleepSessionRow] = [],
-                              epochArchives: [EpochArchiveRow] = []) -> String? {
+                              epochArchives: [EpochArchiveRow] = [],
+                              healthAlerts: [HealthAlertRow] = []) -> String? {
         var root: [String: Any] = [
             "schemaVersion": schemaVersion,
             "exportedAt": iso8601.string(from: now),
@@ -915,8 +976,23 @@ public enum ExportEngine {
                 ] as [String: Any]
             ] as [String: Any] }
         }
+        if !healthAlerts.isEmpty {
+            root["healthAlerts"] = healthAlerts.map { a in [
+                "date": iso8601.string(from: a.date),
+                "notification": a.notification,
+                "fired": a.fired,
+                "reason": a.reason,
+                "value": a.value,
+                "readingTime": jsonOrNull(a.readingTime.map { iso8601.string(from: $0) }),
+                "runSize": a.runSize,
+                "evidenceEpochs": a.evidenceEpochs,
+                "badEpochs": a.badEpochs,
+                "evidenceSummary": jsonOrNull(a.evidenceSummary)
+            ] as [String: Any] }
+        }
         root["provenance"] = provenance(includesSleepSessions: !sleepSessions.isEmpty,
-                                        includesEpochArchive: !epochArchives.isEmpty)
+                                        includesEpochArchive: !epochArchives.isEmpty,
+                                        includesHealthAlerts: !healthAlerts.isEmpty)
         root["units"] = units
         root["notes"] = notes
 
@@ -937,7 +1013,8 @@ public enum ExportEngine {
     /// `ExportSchemaV3Tests` enumerates the emitted top-level keys against this map, so a new
     /// section added without a classification fails the suite rather than shipping unlabelled.
     private static func provenance(includesSleepSessions: Bool,
-                                   includesEpochArchive: Bool = false) -> [String: String] {
+                                   includesEpochArchive: Bool = false,
+                                   includesHealthAlerts: Bool = false) -> [String: String] {
         var map: [String: String] = [
             "samples": "measured",
             "stepSamples": "measured",
@@ -947,6 +1024,11 @@ public enum ExportEngine {
             "naps": "derived",
             "historySyncEvidence": "diagnostic"
         ]
+        if includesHealthAlerts {
+            // DIAGNOSTIC: a statement about what the APP decided, not about the wearer. The
+            // readings these rows name live in `samples`, classified `measured` there.
+            map["healthAlerts"] = "diagnostic"
+        }
         if includesEpochArchive {
             // MEASURED: these are the ring's own bytes, deduped — nothing is estimated.
             map["epochArchive"] = "measured"
@@ -1022,6 +1104,12 @@ public enum ExportEngine {
     /// Honest caveats shipped inside the file. Every one of these is a claim we would otherwise
     /// be making silently by exporting the number at all.
     private static var notes: [String: String] { [
+        "healthAlerts": "What the app DECIDED about a threshold alert, not what your body did. "
+            + "A `suppressed` row means a reading crossed the threshold and the app chose not to "
+            + "notify you — the reading itself is still in `samples` and in Apple Health. "
+            + "`badEpochs`/`evidenceEpochs` count how many of the readings behind the decision came "
+            + "from an epoch where the ring was moving or not worn; `evidenceEpochs` of 0 means no "
+            + "raw record could be matched, so the decision rested on the readings alone.",
         "hrvSDNN":
             "The hrvSDNN sample kind carries RMSSD, not SDNN. The ring reports RMSSD and " +
             "HealthKit offers only an SDNN field; no fixed RMSSD→SDNN conversion exists, so the " +

@@ -705,6 +705,12 @@ final class RingSession: NSObject {
     /// Namespaced by the ring's identifier (#multi-ring) so two rings' epoch archives can't collide on
     /// the UInt32 epoch counter (which would corrupt overnight stitching).
     let epochArchiveStore: EpochArchiveStore
+    /// This ring's identifier, i.e. `epochArchiveStore`'s namespace — exposed so a caller that
+    /// already holds `epochArchiveStore` (and has therefore already paid to load+decode it) can
+    /// recognise and skip it when separately iterating every REMEMBERED ring's archive, instead of
+    /// redundantly reloading and redecoding the same bytes under a freshly constructed
+    /// `EpochArchiveStore(namespace:)` for the identical namespace.
+    var ringID: String { peripheral.identifier.uuidString }
     /// `writeChar` can outlive an actual usable link during reconnect churn, so connection state
     /// is part of the write gate too.
     private var canWriteCommands: Bool {
