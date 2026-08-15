@@ -391,16 +391,29 @@ struct SleepCardView: View {
         return LocalStore(modelContext).hypnogram(night: night.nightKey)
     }
 
-    /// Overnight HR points for the "Sleep HR" overlay, narrowed from the SAME `recentVitals` query
-    /// `overnightAverages` already uses — empty (not an error) once the night has aged out of the
-    /// 3-day window, which disables the toggle rather than drawing an empty line.
-    private func hrPoints(_ night: Night) -> [(Date, Double)] {
-        guard let start = night.inBedStart, let end = night.inBedEnd, end > start else { return [] }
-        let raw = MetricKind.heartRate.rawValue
-        return recentVitals
-            .filter { $0.kindRaw == raw && $0.start >= start && $0.start <= end && $0.value > 0 }
-            .sorted { $0.start < $1.start }
-            .map { ($0.start, $0.value) }
+    /// Overnight HR / HRV / SpO₂ for the "Sleep HR" overlay AND the hypnogram's scrub read-out
+    /// (#186), narrowed from the SAME `recentVitals` query `overnightAverages` already uses —
+    /// empty (not an error) once the night has aged out of the 3-day window, which disables the
+    /// toggle rather than drawing an empty line; scrubbing still reports time + stage. SpO₂ is
+    /// left 0…1 as stored (see `overnightAverages` below) — the view multiplies by 100.
+    private func vitals(_ night: Night) -> SleepVitalsSeries {
+        guard let start = night.inBedStart, let end = night.inBedEnd, end > start else { return .empty }
+        let hrRaw = MetricKind.heartRate.rawValue
+        let hrvRaw = MetricKind.hrvSDNN.rawValue
+        let spo2Raw = MetricKind.spo2.rawValue
+        var hr: [SleepVitalsSeries.Sample] = []
+        var hrv: [SleepVitalsSeries.Sample] = []
+        var spo2: [SleepVitalsSeries.Sample] = []
+        for s in recentVitals where s.start >= start && s.start <= end && s.value > 0 {
+            switch s.kindRaw {
+            case hrRaw: hr.append(.init(time: s.start, value: s.value))
+            case hrvRaw: hrv.append(.init(time: s.start, value: s.value))
+            case spo2Raw: spo2.append(.init(time: s.start, value: s.value))
+            default: break
+            }
+        }
+        // `recentVitals` is sorted newest-first; the chart wants oldest→newest.
+        return SleepVitalsSeries(hr: hr.reversed(), hrv: hrv.reversed(), spo2: spo2.reversed())
     }
 
     @ViewBuilder
@@ -428,7 +441,7 @@ struct SleepCardView: View {
         // Sleep Stages (#70 RingConn clone): timestamped hypnogram + axis + legend + movement
         // strip + per-stage stat rows, replacing the old proportional bar/legend pair.
         SleepStagesSection(segments: stageSegments(night), movementLevels: latest?.movementLevels ?? [],
-                          movementWindowStart: night.inBedStart, hrPoints: hrPoints(night), minutes: m)
+                          movementWindowStart: night.inBedStart, vitals: vitals(night), minutes: m)
         // When we actually fell asleep / woke (distinct from the bedtime window) + latency — this is
         // what makes the in-bed-vs-asleep gap legible ("I wasn't asleep yet at 11pm").
         sleepWindowCaption(night)

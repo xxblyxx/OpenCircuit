@@ -5,6 +5,12 @@ import OpenCircuitKit
 /// legend, a grayscale movement strip, and four per-stage stat rows with reference-range ticks.
 /// Replaces the old proportional `stageBar`/`stageLegend` capsule and the height-coded
 /// `movementSection` strip in `SleepCardView`.
+///
+/// #186 adds drag-to-scrub: press anywhere on the hypnogram and a callout above it reports the
+/// time, sleep stage, and (when a nearby sample exists) HR / HRV / SpO₂ at that instant. The
+/// callout lives in its own reserved lane rather than floating over the 120pt plot — `HeroCard`/
+/// `HeroSparkline` (Design/LivelineCharts.swift) already learned that lesson: a floating
+/// annotation over a short chart clips or covers the data it's explaining.
 struct SleepStagesSection: View {
     /// The night's decoded hypnogram (from `LocalStore.hypnogram(night:)` or `liveSegments`).
     /// Includes the envelope `.inBed` segment; it's excluded from the per-time lanes below (it
@@ -16,12 +22,34 @@ struct SleepStagesSection: View {
     /// a stitched one.
     let movementLevels: [Int]
     let movementWindowStart: Date?
-    /// Overnight HR samples for the "Sleep HR" overlay. Empty disables the toggle rather than
-    /// drawing an empty line (the samples backing it are pruned after `sampleRetentionDays`).
-    let hrPoints: [(Date, Double)]
+    /// Overnight HR/HRV/SpO₂ for the "Sleep HR" overlay AND the scrub callout. Empty disables the
+    /// toggle rather than drawing an empty line (the samples backing it are pruned after
+    /// `sampleRetentionDays`) — scrubbing still reports time + stage in that case.
+    let vitals: SleepVitalsSeries
     let minutes: (inBed: Int, awake: Int, light: Int, deep: Int, rem: Int, asleep: Int)
 
-    @State private var showHR = false
+    /// Persisted (not view-local) so re-opening the Sleep tab doesn't forget the overlay was on —
+    /// matches how `units.*` / `sleepSchedule.*` are stored in `SleepCardView`.
+    @AppStorage("sleep.showHROverlay") private var showHR = false
+
+    // MARK: Scrub state (#186)
+
+    /// Whether the current touch is scrubbing the chart, mid-vertical-scroll (hands off), or idle.
+    /// `@GestureState`, not `@State`: when the enclosing ScrollView takes over a simultaneous
+    /// touch, SwiftUI may cancel this gesture without an `onEnded` callback, and `@GestureState`
+    /// resets to `.idle` on cancellation too — so "lifting clears the callout" holds on every path
+    /// with no manual bookkeeping.
+    private enum DragPhase: Equatable {
+        case idle
+        case scrubbing(CGFloat)   // x, in the chart's local coordinate space
+        case scrolling
+    }
+    @GestureState private var drag: DragPhase = .idle
+    @State private var plotWidth: CGFloat = 0
+    @State private var pillWidth: CGFloat = 0
+    /// VoiceOver's position when stepping the chart with the adjustable action, independent of
+    /// `drag` (a pointer gesture VoiceOver users don't perform).
+    @State private var axIndex: Int?
 
     private static let movementEpochSeconds: TimeInterval = 150 // BulkRecord.epochSeconds
 
@@ -31,6 +59,14 @@ struct SleepStagesSection: View {
         return (start, end)
     }
 
+    /// `vitals` narrowed to the chart's own domain. `vitals.hr` is windowed on the night's in-bed
+    /// span (`SleepCardView.vitals(_:)`), which can differ from this segment-derived domain on a
+    /// live-staged night — scrubbing must only snap to samples that actually have an on-screen x.
+    private var domainVitals: SleepVitalsSeries {
+        guard let domain else { return .empty }
+        return vitals.clamped(to: domain.start, end: domain.end)
+    }
+
     private var shares: [SleepStageBreakdown.StageShare] { SleepStageBreakdown.breakdown(minutes) }
 
     private var chartAccessibilitySummary: String {
@@ -38,14 +74,26 @@ struct SleepStagesSection: View {
             .joined(separator: ", ")
     }
 
+    private var axStagedSegments: [SleepSegment] { stagedSegments(segments) }
+
     var body: some View {
         if let domain {
             VStack(alignment: .leading, spacing: 10) {
                 header
+                calloutLane
                 HypnogramChart(segments: segments, domain: domain,
-                               hrPoints: showHR ? hrPoints : [],
-                               accessibilitySummary: chartAccessibilitySummary)
+                               hr: showHR ? domainVitals.hr : [],
+                               scrubDate: scrubReadout?.date)
                     .frame(height: 120)
+                    .background(WidthReader(width: $plotWidth))
+                    .contentShape(Rectangle())   // the ZStack is mostly empty space otherwise
+                    .simultaneousGesture(scrubGesture)
+                    .sensoryFeedback(trigger: scrubTick) { _, new in new.bucket == nil ? nil : .selection }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Sleep stages over the night")
+                    .accessibilityValue(axIndex.map(axReadout) ?? chartAccessibilitySummary)
+                    .accessibilityHint("Swipe up or down to move through the night")
+                    .accessibilityAdjustableAction(adjustAX)
                 axisRow(domain)
                 legend
                 MovementStrip(levels: movementLevels,
@@ -55,6 +103,174 @@ struct SleepStagesSection: View {
             }
             .padding(.top, 2)
         }
+    }
+
+    // MARK: Scrub gesture
+
+    private var scrubGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .updating($drag) { value, state, _ in
+                guard state != .scrolling else { return }
+                // Once the touch is unambiguously a vertical page pan, hand off rather than
+                // dragging the callout along with the scroll — the ScrollView is already panning
+                // (this gesture runs simultaneously, never exclusively).
+                let dx = abs(value.translation.width), dy = abs(value.translation.height)
+                if dy > 12, dy > dx * 2 { state = .scrolling; return }
+                state = .scrubbing(value.location.x)
+            }
+    }
+
+    /// One instant's full read-out: the snapped time, its position on the domain, the covering
+    /// stage, and any nearby HR/HRV/SpO₂. Shared by the drag callout and the VoiceOver adjustable
+    /// action so the two can never report different numbers for "the same" moment.
+    private struct ScrubReadout {
+        let date: Date
+        let fraction: Double
+        let stage: SleepStage?
+        let hr: Double?
+        let hrv: Double?
+        let spo2: Double?
+    }
+
+    private func readout(near date: Date) -> ScrubReadout {
+        let hrTimes = domainVitals.hr.map(\.time)
+        var snapped = date
+        var hrValue: Double?
+        if let idx = SleepScrub.nearestIndex(in: hrTimes, to: date) {
+            // Real sample nearby — snap to it exactly, never interpolate.
+            snapped = domainVitals.hr[idx].time
+            hrValue = domainVitals.hr[idx].value
+        } else if hrTimes.isEmpty {
+            // No HR data for this night at all (aged past the 3-day window): round to the minute
+            // rather than reporting a sub-second finger position as "the" time.
+            snapped = roundedToMinute(date)
+        }
+        // else: HR data exists elsewhere tonight but this instant sits in a real gap — keep the
+        // raw finger time and simply omit bpm below, rather than borrowing a distant sample.
+        let stage = SleepScrub.stage(at: snapped, in: segments)
+        let hrv = domainVitals.value(in: domainVitals.hrv, near: snapped)
+        let spo2 = domainVitals.value(in: domainVitals.spo2, near: snapped)
+        let fraction = domain.flatMap { SleepScrub.fraction(of: snapped, start: $0.start, end: $0.end) } ?? 0
+        return ScrubReadout(date: snapped, fraction: fraction, stage: stage, hr: hrValue, hrv: hrv, spo2: spo2)
+    }
+
+    private var scrubReadout: ScrubReadout? {
+        guard case .scrubbing(let x) = drag, let domain, plotWidth > 0 else { return nil }
+        let f = Double(x / plotWidth)
+        let rawDate = SleepScrub.date(atFraction: f, start: domain.start, end: domain.end)
+        return readout(near: rawDate)
+    }
+
+    /// Identity of "which real sample the rule is on" — changes exactly when the snap moves, so
+    /// `.sensoryFeedback` below ticks once per sample rather than once per drag event.
+    private struct ScrubTick: Equatable { let bucket: TimeInterval?; let stage: SleepStage? }
+
+    private var scrubTick: ScrubTick {
+        guard let r = scrubReadout else { return ScrubTick(bucket: nil, stage: nil) }
+        return ScrubTick(bucket: r.date.timeIntervalSince1970, stage: r.stage)
+    }
+
+    private func roundedToMinute(_ d: Date) -> Date {
+        Date(timeIntervalSince1970: (d.timeIntervalSince1970 / 60).rounded() * 60)
+    }
+
+    // MARK: Callout lane
+
+    /// Reserved space above the chart, sized by an invisible worst-case pill so the chart below
+    /// never jumps when the real callout appears — including at large Dynamic Type sizes, where
+    /// the pill wraps taller.
+    private var calloutLane: some View {
+        ZStack(alignment: .topLeading) {
+            calloutPillBody(time: "12:42 AM", hr: "188 bpm", stageName: "Deep Sleep",
+                            hrv: "188ms HRV", spo2: "100% SpO₂")
+                .opacity(0)
+                .accessibilityHidden(true)
+            if let r = scrubReadout {
+                // Points at the UNCLAMPED position so a pill clamped to the card edge still shows
+                // which instant it belongs to.
+                Rectangle()
+                    .fill(Color.primary.opacity(0.35))
+                    .frame(width: 1, height: 5)
+                    .offset(x: plotWidth * CGFloat(r.fraction) - 0.5)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                calloutPillBody(time: Self.clock(r.date),
+                                hr: (showHR ? r.hr : nil).map { "\(Int($0.rounded())) bpm" },
+                                stageName: r.stage.map(stageDisplayName),
+                                hrv: r.hrv.map { "\(Int($0.rounded()))ms HRV" },
+                                spo2: r.spo2.map { "\(Int(($0 * 100).rounded()))% SpO₂" })
+                    .fixedSize()
+                    .background(WidthReader(width: $pillWidth))
+                    .offset(x: clampedPillX(r.fraction))
+                    .animation(nil, value: r.date)   // track the finger exactly, no lag
+                    .accessibilityHidden(true)        // the chart element already voices this
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private func clampedPillX(_ fraction: Double) -> CGFloat {
+        guard plotWidth > 0 else { return 0 }
+        let target = plotWidth * CGFloat(fraction) - pillWidth / 2
+        return min(max(0, target), max(0, plotWidth - pillWidth))
+    }
+
+    @ViewBuilder
+    private func calloutPillBody(time: String, hr: String?, stageName: String?,
+                                 hrv: String?, spo2: String?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(time).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).monospacedDigit()
+            if hr == nil && stageName == nil {
+                Text("No data").font(.caption.weight(.medium)).foregroundStyle(.tertiary)
+            } else {
+                HStack(spacing: 5) {
+                    if let hr { Text(hr).foregroundStyle(Theme.hr) }
+                    if hr != nil, stageName != nil { Text("·").foregroundStyle(.tertiary) }
+                    if let stageName { Text(stageName).foregroundStyle(.primary) }
+                }
+                .font(.caption.weight(.semibold)).monospacedDigit()
+            }
+            if hrv != nil || spo2 != nil {
+                HStack(spacing: 5) {
+                    if let hrv { Text(hrv).foregroundStyle(Theme.hrv) }
+                    if hrv != nil, spo2 != nil { Text("·").foregroundStyle(.tertiary) }
+                    if let spo2 { Text(spo2).foregroundStyle(Theme.spo2) }
+                }
+                .font(.caption2.weight(.medium)).monospacedDigit()
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08))
+                )
+        )
+    }
+
+    // MARK: VoiceOver stepping
+
+    private func axReadout(_ i: Int) -> String {
+        guard axStagedSegments.indices.contains(i) else { return chartAccessibilitySummary }
+        let seg = axStagedSegments[i]
+        let r = readout(near: seg.start.addingTimeInterval(seg.duration / 2))
+        var parts = [Self.clock(seg.start), stageDisplayName(seg.stage)]
+        if showHR, let hr = r.hr { parts.append("\(Int(hr.rounded())) beats per minute") }
+        return parts.joined(separator: ", ")
+    }
+
+    private func adjustAX(_ direction: AccessibilityAdjustmentDirection) {
+        let count = axStagedSegments.count
+        guard count > 0 else { return }
+        var i = axIndex ?? 0
+        switch direction {
+        case .increment: i = min(i + 1, count - 1)
+        case .decrement: i = max(i - 1, 0)
+        @unknown default: break
+        }
+        axIndex = i
     }
 
     private var header: some View {
@@ -83,11 +299,11 @@ struct SleepStagesSection: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
-        .disabled(hrPoints.isEmpty)
-        .opacity(hrPoints.isEmpty ? 0.4 : 1)
+        .disabled(vitals.hr.isEmpty)
+        .opacity(vitals.hr.isEmpty ? 0.4 : 1)
         .accessibilityLabel("Sleep HR overlay")
         .accessibilityValue(showHR ? "On" : "Off")
-        .accessibilityHint(hrPoints.isEmpty ? "No heart rate samples for this night" : "")
+        .accessibilityHint(vitals.hr.isEmpty ? "No heart rate samples for this night" : "")
     }
 
     /// 5 evenly quartered clock labels, first flush-leading / last flush-trailing / rest spread
@@ -158,6 +374,35 @@ private func stageColor(_ stage: SleepStage) -> Color {
     }
 }
 
+/// Real (non-`.inBed`) segments only, oldest as given — shared by the hypnogram's lane layout and
+/// the VoiceOver stepping order so they can't disagree about what "segment 3" means.
+private func stagedSegments(_ segments: [SleepSegment]) -> [SleepSegment] {
+    segments.filter { $0.stage != .inBed }
+}
+
+// MARK: - Width measurement
+
+/// Publishes the width SwiftUI actually laid the host view out at, via an invisible full-size
+/// `GeometryReader` in the background. Used both for the chart's plot width (to place the scrub
+/// rule/dot) and the callout pill's own width (to clamp it inside the card).
+private struct WidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+private struct WidthReader: View {
+    @Binding var width: CGFloat
+    var body: some View {
+        GeometryReader { geo in
+            Color.clear.preference(key: WidthPreferenceKey.self, value: geo.size.width)
+        }
+        .onPreferenceChange(WidthPreferenceKey.self) { new in
+            // Skip sub-pixel churn so it can't loop with SwiftUI's own layout pass.
+            if abs(new - width) > 0.5 { width = new }
+        }
+    }
+}
+
 // MARK: - Hypnogram
 
 /// Four-lane time-axis hypnogram (Awake / REM / Light / Deep, top to bottom — the reference
@@ -166,15 +411,14 @@ private func stageColor(_ stage: SleepStage) -> Color {
 private struct HypnogramChart: View {
     let segments: [SleepSegment]
     let domain: (start: Date, end: Date)
-    let hrPoints: [(Date, Double)]
-    let accessibilitySummary: String
+    let hr: [SleepVitalsSeries.Sample]
+    /// The scrub callout's current time, or nil when no touch is active — draws the vertical rule.
+    let scrubDate: Date?
 
     private static let laneOrder: [SleepStage] = [.awake, .asleepREM, .asleepCore, .asleepDeep]
     private static let laneGap: CGFloat = 5
 
-    /// Real (non-inBed) segments only — `.inBed` is the whole-block envelope and would paint over
-    /// every lane for the full width if drawn (see `SleepStagesSection.segments` doc).
-    private var staged: [SleepSegment] { segments.filter { $0.stage != .inBed } }
+    private var staged: [SleepSegment] { stagedSegments(segments) }
 
     var body: some View {
         GeometryReader { geo in
@@ -185,8 +429,8 @@ private struct HypnogramChart: View {
                 connectors(laneHeight: laneHeight, totalSpan: totalSpan)
                 ForEach(Array(staged.enumerated()), id: \.offset) { _, seg in
                     if let lane = Self.laneOrder.firstIndex(of: seg.stage), totalSpan > 0 {
-                        let leading = xPos(max(seg.start, domain.start), totalSpan, geo.size.width)
-                        let trailing = xPos(min(seg.end, domain.end), totalSpan, geo.size.width)
+                        let leading = xPos(max(seg.start, domain.start), geo.size.width)
+                        let trailing = xPos(min(seg.end, domain.end), geo.size.width)
                         let minWidth: CGFloat = seg.stage == .awake ? 2.5 : 1.5
                         let width = max(trailing - leading, minWidth)
                         RoundedRectangle(cornerRadius: 1.5)
@@ -195,18 +439,21 @@ private struct HypnogramChart: View {
                             .position(x: leading + width / 2, y: Self.laneY(lane, laneHeight) + laneHeight / 2)
                     }
                 }
-                if !hrPoints.isEmpty {
-                    HRLine(points: hrPoints, domain: domain)
+                if !hr.isEmpty {
+                    HRLine(points: hr, domain: domain, scrubDate: scrubDate)
+                }
+                if let scrubDate, totalSpan > 0 {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.35))
+                        .frame(width: 1, height: geo.size.height)
+                        .position(x: xPos(scrubDate, geo.size.width), y: geo.size.height / 2)
                 }
             }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Sleep stages over the night")
-        .accessibilityValue(accessibilitySummary)
     }
 
-    private func xPos(_ d: Date, _ totalSpan: TimeInterval, _ width: CGFloat) -> CGFloat {
-        width * CGFloat(d.timeIntervalSince(domain.start) / totalSpan)
+    private func xPos(_ d: Date, _ width: CGFloat) -> CGFloat {
+        width * CGFloat(SleepScrub.fraction(of: d, start: domain.start, end: domain.end) ?? 0)
     }
 
     private static func laneY(_ index: Int, _ laneHeight: CGFloat) -> CGFloat {
@@ -222,7 +469,7 @@ private struct HypnogramChart: View {
                    let laneA = Self.laneOrder.firstIndex(of: prev.stage),
                    let laneB = Self.laneOrder.firstIndex(of: cur.stage) {
                     GeometryReader { geo in
-                        let x = xPos(cur.start, totalSpan, geo.size.width)
+                        let x = xPos(cur.start, geo.size.width)
                         let yTop = min(Self.laneY(laneA, laneHeight), Self.laneY(laneB, laneHeight)) + laneHeight / 2
                         let yBottom = max(Self.laneY(laneA, laneHeight), Self.laneY(laneB, laneHeight)) + laneHeight / 2
                         Rectangle()
@@ -237,29 +484,43 @@ private struct HypnogramChart: View {
 }
 
 /// The optional "Sleep HR" overlay: a thin line scaled to the night's own HR min…max, drawn over
-/// the full hypnogram rect.
+/// the full hypnogram rect, with a highlighted dot at the scrubbed sample when one is snapped.
 private struct HRLine: View {
-    let points: [(Date, Double)]
+    let points: [SleepVitalsSeries.Sample]
     let domain: (start: Date, end: Date)
+    let scrubDate: Date?
 
     var body: some View {
         GeometryReader { geo in
             let totalSpan = domain.end.timeIntervalSince(domain.start)
-            let values = points.map(\.1)
+            let values = points.map(\.value)
             let minV = values.min() ?? 0
             let maxV = values.max() ?? 1
             let span = max(maxV - minV, 1)
+            let sorted = points.sorted { $0.time < $1.time }
+
             Path { path in
-                let sorted = points.sorted { $0.0 < $1.0 }
                 for (i, p) in sorted.enumerated() {
                     guard totalSpan > 0 else { break }
-                    let px = geo.size.width * CGFloat(p.0.timeIntervalSince(domain.start) / totalSpan)
-                    let py = geo.size.height * (1 - CGFloat((p.1 - minV) / span))
+                    let px = geo.size.width * CGFloat(p.time.timeIntervalSince(domain.start) / totalSpan)
+                    let py = geo.size.height * (1 - CGFloat((p.value - minV) / span))
                     if i == 0 { path.move(to: CGPoint(x: px, y: py)) }
                     else { path.addLine(to: CGPoint(x: px, y: py)) }
                 }
             }
             .stroke(Theme.hr.opacity(0.85), lineWidth: 1.4)
+
+            if let scrubDate, totalSpan > 0,
+               let idx = SleepScrub.nearestIndex(in: sorted.map(\.time), to: scrubDate) {
+                let p = sorted[idx]
+                let px = geo.size.width * CGFloat(p.time.timeIntervalSince(domain.start) / totalSpan)
+                let py = geo.size.height * (1 - CGFloat((p.value - minV) / span))
+                Circle()
+                    .fill(Theme.hr)
+                    .frame(width: 7, height: 7)
+                    .overlay(Circle().strokeBorder(Theme.cardBackground, lineWidth: 1.5))
+                    .position(x: px, y: py)
+            }
         }
     }
 }
@@ -299,8 +560,8 @@ private struct MovementStrip: View {
                             ForEach(Array(levels.enumerated()), id: \.offset) { i, lvl in
                                 if lvl > 0 {
                                     let t = windowStart.addingTimeInterval(Double(i) * epochSeconds)
-                                    let frac = t.timeIntervalSince(domain.start) / totalSpan
-                                    if frac >= 0, frac <= 1 {
+                                    if let frac = SleepScrub.fraction(of: t, start: domain.start, end: domain.end),
+                                       frac >= 0, frac <= 1 {
                                         Rectangle()
                                             .fill(lvl >= 2 ? Color.secondary : Color.secondary.opacity(0.55))
                                             .frame(width: 2.5, height: geo.size.height)
@@ -410,18 +671,47 @@ private struct StageStatRow: View {
         let nearAwake = segs.contains { $0.stage == .awake && abs($0.start.timeIntervalSince(at)) < 300 }
         return nearAwake ? Int.random(in: 1...2) : (Double.random(in: 0...1) < 0.04 ? 1 : 0)
     }
-    let hr: [(Date, Double)] = stride(from: 0.0, to: end.timeIntervalSince(start), by: 300).map { off in
-        (start.addingTimeInterval(off), Double.random(in: 48...76))
+    let hr: [SleepVitalsSeries.Sample] = stride(from: 0.0, to: end.timeIntervalSince(start), by: 150).map { off in
+        .init(time: start.addingTimeInterval(off), value: Double.random(in: 48...76))
+    }
+    let hrv: [SleepVitalsSeries.Sample] = stride(from: 0.0, to: end.timeIntervalSince(start), by: 600).map { off in
+        .init(time: start.addingTimeInterval(off), value: Double.random(in: 30...90))
+    }
+    let spo2: [SleepVitalsSeries.Sample] = stride(from: 0.0, to: end.timeIntervalSince(start), by: 900).map { off in
+        .init(time: start.addingTimeInterval(off), value: Double.random(in: 0.94...0.99))
     }
     return ScrollView {
         SleepStagesSection(segments: segs, movementLevels: levels, movementWindowStart: start,
-                           hrPoints: hr, minutes: (461, 16, 225, 100, 120, 445))
+                           vitals: SleepVitalsSeries(hr: hr, hrv: hrv, spo2: spo2),
+                           minutes: (461, 16, 225, 100, 120, 445))
             .padding()
     }
 }
 
 #Preview("No hypnogram") {
     SleepStagesSection(segments: [], movementLevels: [], movementWindowStart: nil,
-                       hrPoints: [], minutes: (0, 0, 0, 0, 0, 0))
+                       vitals: .empty, minutes: (0, 0, 0, 0, 0, 0))
         .padding()
+}
+
+#Preview("Scrub — no HR samples") {
+    // A night aged past the 3-day vitals window: the toggle disables, but the hypnogram and its
+    // scrub (time + stage only) still work.
+    let start = Calendar.current.date(bySettingHour: 23, minute: 10, second: 0, of: Date())!
+    let end = start.addingTimeInterval(420 * 60)
+    let stageDurations: [(SleepStage, TimeInterval)] = [
+        (.awake, 5 * 60), (.asleepCore, 60 * 60), (.asleepDeep, 45 * 60), (.asleepREM, 30 * 60),
+        (.asleepCore, 90 * 60), (.asleepDeep, 40 * 60), (.asleepREM, 50 * 60), (.asleepCore, 90 * 60),
+    ]
+    var t = start.addingTimeInterval(8 * 60)
+    var segs: [SleepSegment] = [SleepSegment(start: start, end: end, stage: .inBed)]
+    for (stage, dur) in stageDurations {
+        segs.append(SleepSegment(start: t, end: t.addingTimeInterval(dur), stage: stage))
+        t = t.addingTimeInterval(dur)
+    }
+    return ScrollView {
+        SleepStagesSection(segments: segs, movementLevels: [], movementWindowStart: nil,
+                           vitals: .empty, minutes: (420, 5, 180, 85, 80, 335))
+            .padding()
+    }
 }
