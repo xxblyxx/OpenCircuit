@@ -26,6 +26,7 @@ struct DeviceInfoView: View {
     @State private var diagnosticsError: String?
     @State private var showRepairImporter = false
     @State private var repairResult: String?
+    @State private var externalSleepResult: String?
     /// Set when the picked export's ring identity doesn't match this one — the merge waits on an
     /// explicit confirmation rather than silently polluting a per-ring archive.
     @State private var pendingForeignImport: (DiagnosticsFrameImport.Result, String, String)?
@@ -268,6 +269,20 @@ struct DeviceInfoView: View {
             if let repairResult {
                 Text(repairResult).font(.caption).foregroundStyle(.secondary)
             }
+            // Import OTHER apps' sleep intervals (Whoop, Apple Watch) from HealthKit as REFERENCE
+            // LABELS for tuning our staging — the per-epoch reference this project has never had
+            // (docs/SLEEP_AWAKE_RESOLUTION.md). Analysis-only: nothing in the health pipeline reads
+            // the result, deliberately, so reference labels can't leak into the classifier they
+            // exist to evaluate. Lands in UserDefaults, which the desktop `--pull` tooling already
+            // fetches.
+            Button {
+                importExternalSleep()
+            } label: {
+                Label("Import reference sleep labels", systemImage: "square.and.arrow.down")
+            }
+            if let externalSleepResult {
+                Text(externalSleepResult).font(.caption).foregroundStyle(.secondary)
+            }
             Toggle("Capture raw history frames", isOn: $captureEnabled)
             LabeledContent("Frames captured", value: "\(session?.diagnosticsFrameCount ?? 0)")
             if (session?.diagnosticsFrameCount ?? 0) > 0 {
@@ -399,6 +414,33 @@ struct DeviceInfoView: View {
             showDiagnosticShare = true
         } catch {
             diagnosticsError = "Couldn't write diagnostics: \(error.localizedDescription)"
+        }
+    }
+
+    /// Read other apps' sleep intervals from HealthKit and cache them for desktop analysis.
+    ///
+    /// ⚠️ THE EMPTY CASE IS NOT AN ERROR, and the copy below must never imply it is. HealthKit does
+    /// not report read authorization (`HealthKitWriter.readExternalSleepSamples`), so zero samples
+    /// is indistinguishable between "Sleep read access is off for us" and "no other app writes
+    /// sleep here". The message therefore states what we observed and names the setting to check,
+    /// rather than asserting either cause.
+    private func importExternalSleep() {
+        externalSleepResult = "Reading…"
+        Task { @MainActor in
+            let days = 30
+            let since = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
+            let samples = await HealthKitWriter().readExternalSleepSamples(from: since)
+            ExternalSleepStore().save(samples, windowDays: days)
+            if samples.isEmpty {
+                externalSleepResult = "Found no readable sleep from other apps in the last \(days) days. "
+                    + "If you expected some, check Health → Sharing → Apps → OpenCircuit and make sure "
+                    + "Sleep is allowed for reading."
+            } else {
+                let awake = samples.awakeIntervals.count
+                let sources = samples.sources.joined(separator: ", ")
+                externalSleepResult = "Imported \(samples.count) intervals (\(awake) awake) "
+                    + "from \(sources), last \(days) days."
+            }
         }
     }
 

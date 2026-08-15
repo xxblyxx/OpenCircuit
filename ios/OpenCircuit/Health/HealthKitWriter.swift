@@ -807,10 +807,72 @@ final class HealthKitWriter {
         return HeadacheReadResult(external: external, ownSourceCount: ownSource.count)
     }
 
+    /// Read OTHER apps' sleep-stage intervals (Whoop, Apple Watch, …) back out of HealthKit as
+    /// REFERENCE LABELS for our own staging. See `ExternalSleepSample` for why these are a
+    /// reference and emphatically not ground truth.
+    ///
+    /// Same three properties as `readHeadacheSamples` above, for the same reasons:
+    ///   • HONEST EMPTY — HealthKit never reports READ authorization (by design: a denial could
+    ///     itself leak a health fact). A denied read returns no samples, INDISTINGUISHABLE from
+    ///     "no other app writes sleep here". `[]` means "nothing readable" and UI copy must say
+    ///     exactly that, never "you have no sleep data".
+    ///   • OWN SAMPLES EXCLUDED — we write `.sleepAnalysis` ourselves (`writeSleepSegments`), so
+    ///     without this filter every import would read our own hypnogram back and "agreement"
+    ///     would be measured against ourselves. Identity is `Bundle.main.bundleIdentifier`, the
+    ///     same test `readHeadacheSamples` uses; a nil bundle id means we cannot tell ours apart,
+    ///     so we refuse rather than pool.
+    ///   • NO ERROR BRANCH — a denied read reports no error, only an empty result, so an error
+    ///     branch could not distinguish the two anyway.
+    ///
+    /// `.asleepUnspecified` maps to `.asleepCore`: a source that does not stage (older Watch
+    /// exports, some third parties) is asserting "asleep" with no depth claim, and Core is our
+    /// unstaged-asleep bucket. It is NOT dropped — an interval we know was asleep still constrains
+    /// the awake comparison this exists for.
+    func readExternalSleepSamples(from start: Date, to end: Date? = nil) async -> [ExternalSleepSample] {
+        guard Self.isAvailable, let ownBundleID = Bundle.main.bundleIdentifier else { return [] }
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+        let samples: [HKCategorySample] = await withCheckedContinuation { cont in
+            let query = HKSampleQuery(
+                sampleType: HKCategoryType(.sleepAnalysis), predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: [NSSortDescriptor(keyPath: \HKSample.startDate, ascending: true)]
+            ) { _, result, _ in
+                cont.resume(returning: (result as? [HKCategorySample]) ?? [])
+            }
+            store.execute(query)
+        }
+        return samples.compactMap { sample -> ExternalSleepSample? in
+            guard sample.sourceRevision.source.bundleIdentifier != ownBundleID,
+                  sample.endDate > sample.startDate,
+                  let stage = Self.sleepStage(forHealthKitValue: sample.value)
+            else { return nil }
+            return ExternalSleepSample(source: sample.sourceRevision.source.name,
+                                       start: sample.startDate,
+                                       end: sample.endDate,
+                                       stage: stage)
+        }
+    }
+
+    /// Map an `HKCategoryValueSleepAnalysis` raw value to our `SleepStage`. Returns nil for a value
+    /// this OS version doesn't define (forward compatibility: a future stage is skipped, not
+    /// coerced into a wrong bucket).
+    private static func sleepStage(forHealthKitValue value: Int) -> SleepStage? {
+        switch value {
+        case HKCategoryValueSleepAnalysis.inBed.rawValue: return .inBed
+        case HKCategoryValueSleepAnalysis.awake.rawValue: return .awake
+        case HKCategoryValueSleepAnalysis.asleepCore.rawValue: return .asleepCore
+        case HKCategoryValueSleepAnalysis.asleepDeep.rawValue: return .asleepDeep
+        case HKCategoryValueSleepAnalysis.asleepREM.rawValue: return .asleepREM
+        case HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue: return .asleepCore
+        default: return nil
+        }
+    }
+
     func requestAuthorization() async throws {
         // Read sleepAnalysis so the iOS Sleep-schedule window (HealthKitSleepSchedule) works
         // the moment the HealthKit entitlement is enabled — no further auth change needed.
-        // (No effect today: without the entitlement the request is a no-op, so it can't prompt.)
+        // (Enabled 2026-06-15: `com.apple.developer.healthkit` is set in project.yml, so this
+        // request is live and `readExternalSleepSamples` above can return data.)
         var read: Set<HKObjectType> = [HKCategoryType(.sleepAnalysis)]
         for type in allTypes {
             if type is HKWorkoutType || type is HKSeriesType { continue }
