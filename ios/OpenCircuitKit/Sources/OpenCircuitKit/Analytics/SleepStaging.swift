@@ -729,6 +729,16 @@ public enum SleepStaging {
         // rows — the interior-arousal pass (`markInteriorArousals`, `Tuning.arousalIntensityCut`)
         // thresholds this directly rather than the already-collapsed `motionMagnitudes` 0/1/16 scale.
         var rowTailSums: [Int] = []
+        // Parallel to `rows`: the record itself, so `markInteriorArousals` can decide its motion-
+        // channel verdict on the SLICE it is about to mark (`records[lo+1..<hi]`) rather than the
+        // whole in-bed block. 🟢 MEASURED (2026-08-15): the whole-block verdict is a single
+        // all-or-nothing quantifier over `motionIsPlaceholder` — 3 genuinely-expressive getting-up
+        // epochs at a block's tail end are enough to flip the ENTIRE night to `.primary` and disable
+        // the pass, even when the sleep interior itself is 100% dead-primary
+        // (`BulkSleep.swift:462-466` already documents exactly this failure mode). Re-deciding on the
+        // interior slice fixes it without touching `motionSource`/`motionMagnitudes` themselves,
+        // which `BulkSleep.swift:462-478` measures as unsafe to widen globally.
+        var rowRecords: [BulkRecord] = []
         // Per-epoch motion energy is measured ABOVE a LOCAL idle floor (same rolling estimate as
         // detection). Gen 2 idles at ~1, Gen 3 at ~15–16 and DRIFTS across the night with posture
         // (16→24→39, 🟢 FR05.008 capture 2026-06-23). The old `$1 == 1 ? 0 : …` hard-coded Gen 2's
@@ -743,10 +753,6 @@ public enum SleepStaging {
         let floor = ActivityPeriod.rollingLowPercentile(rawMotion, times: times,
                         windowSeconds: ActivityPeriod.motionFloorWindowSecondsStaging,
                         percentile: ActivityPeriod.motionFloorPercentile)
-        // Whether THIS run reads motion off the intensity tail at all — decided once, over the whole
-        // in-bed block, exactly as `motionMagnitudes` above decides it internally. Gates
-        // `markInteriorArousals`: a night with an expressive primary channel never reaches it.
-        let usesTailChannel = BulkSleep.usesMotionIntensityFallback(inBlock)
         let tailSums = BulkSleep.motionIntensityTailSums(inBlock)
         for (idx, r) in inBlock.enumerated() {
             if let hr = r.heartRate { lastHR = hr }
@@ -758,6 +764,7 @@ public enum SleepStaging {
             rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR, r.hrvRMSSD != nil))
             rowLayouts.append(r.layout)
             rowTailSums.append(tailSums[idx])
+            rowRecords.append(r)
         }
         guard rows.count >= 2 else { return [] }
 
@@ -907,7 +914,7 @@ public enum SleepStaging {
         // Runs AFTER onset/offset are fixed and marks ONLY lo < i < hi, so it can never move onset
         // or final wake — `sleepSpan` above is NOT recomputed after this. See `markInteriorArousals`
         // and `Tuning.arousalIntensityCut` for the full argument.
-        markInteriorArousals(&awake, tailSums: rowTailSums, usesTailChannel: usesTailChannel,
+        markInteriorArousals(&awake, tailSums: rowTailSums, records: rowRecords,
                              lo: lo, hi: hi, tuning: tuning)
 
         let windowStart = rows[lo].time
@@ -1580,14 +1587,36 @@ public enum SleepStaging {
     /// (345), which 🟢 measured only ever fires at a night's edges, never its interior.
     ///
     /// SAFETY: this can ONLY add interior awake. It never touches index `lo` or `hi`, so it cannot
-    /// move onset or final wake — `sleepSpan` is not, and must not be, recomputed after it runs. It is
-    /// also gated on `usesTailChannel`: the primary `[10:15]` channel's magnitudes are a different
-    /// scale (post-floor-subtraction energy, not a raw tail byte-sum), so applying this cut there would
-    /// be a silent unit error, not a fix.
-    static func markInteriorArousals(_ awake: inout [Bool], tailSums: [Int], usesTailChannel: Bool,
+    /// move onset or final wake — `sleepSpan` is not, and must not be, recomputed after it runs.
+    ///
+    /// The motion-channel verdict is decided on the INTERIOR SLICE (`records[lo+1..<hi]`), not the
+    /// whole in-bed block passed to `BulkSleep.motionMagnitudes`/`motionSource` elsewhere. 🟢 MEASURED
+    /// (2026-08-15, the first real night this shipped on): `usesMotionIntensityFallback`'s
+    /// `constantFiller` test is all-or-nothing — every worn epoch in the evaluated set must be a
+    /// `[10:15]` placeholder — and a block-scoped verdict let 3 genuinely-expressive GETTING-UP
+    /// epochs at the very end of the block (243 worn epochs total) flip the ENTIRE night to
+    /// `.primary`, disabling this pass even though the sleep interior itself (199 epochs) was 100%
+    /// dead-primary. `BulkSleep.swift:462-466` already documents this exact failure mode
+    /// ("a handful of getting-up epochs disqualify the whole run"). Deciding on the interior instead
+    /// is self-consistent by construction — the window tested is exactly the window written to — and
+    /// touches NOTHING else: `motionSource`/`motionMagnitudes` (which drive onset/offset and every
+    /// other pass in this function) still see the whole block, byte-identically. Widening THOSE
+    /// globally is a measured trap (`BulkSleep.swift:462-478`: a placeholder-share threshold swung
+    /// staged sleep −85…+45 min across the corpus) — this pass avoids that entirely by staying a
+    /// second, independent, strictly-interior-only decision.
+    ///
+    /// KNOWN LIMITATION, not fixed here: one genuine large mid-night movement makes the interior
+    /// non-all-placeholder and disables the pass for that night. Graceful degradation, not a
+    /// regression — that movement already clears `awakeMotion` and surfaces as an awakening on its
+    /// own; only the smaller stirs on that particular night are lost. A placeholder-SHARE threshold
+    /// would fix it but is exactly the kind of unvalidated constant the corpus measurement above
+    /// warns against inventing without evidence — revisit only if this is observed to bite.
+    static func markInteriorArousals(_ awake: inout [Bool], tailSums: [Int], records: [BulkRecord],
                                      lo: Int, hi: Int, tuning: Tuning) {
-        guard tuning.arousalIntensityCut > 0, usesTailChannel,
-              tailSums.count == awake.count, hi > lo + 1 else { return }
+        guard tuning.arousalIntensityCut > 0, tailSums.count == awake.count,
+              records.count == awake.count, hi > lo + 1 else { return }
+        let interior = Array(records[(lo + 1) ..< hi])
+        guard BulkSleep.usesMotionIntensityFallback(interior) else { return }
         for i in (lo + 1) ..< hi where tailSums[i] >= tuning.arousalIntensityCut {
             awake[i] = true
         }

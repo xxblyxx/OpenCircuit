@@ -159,4 +159,47 @@ final class SleepStagingInteriorArousalTests: XCTestCase {
         let segs = SleepStaging.classify(from: records)
         XCTAssertEqual(SleepAwakenings.from(segments: segs).count, 3)
     }
+
+    // MARK: Regression -- the shape that shipped inert (2026-08-15)
+
+    /// A genuinely-expressive-primary "getting up" epoch, with elevated HR and zero tail (a real
+    /// getting-up epoch clears BOTH the motion and HR gates on the primary channel -- unlike the
+    /// tail-fallback arousals this pass targets, which the primary channel can't see at all).
+    private func mvrecMoving(_ counter: UInt32, hr: UInt8 = 70) -> BulkRecord {
+        var b = [UInt8](repeating: 0, count: 23)
+        b[0] = UInt8(counter >> 24); b[1] = UInt8((counter >> 16) & 0xFF)
+        b[2] = UInt8((counter >> 8) & 0xFF); b[3] = UInt8(counter & 0xFF)
+        b[4] = hr; b[8] = 0x62
+        let pattern: [UInt8] = [40, 60, 20, 55, 35]
+        for k in 0..<5 { b[10 + k] = pattern[k] }
+        return BulkRecord(b)!
+    }
+
+    /// 🟢 THE BUG THAT SHIPPED INERT (2026-08-15): a real night measured this exact shape. The
+    /// sleep INTERIOR is 100% dead-primary (placeholder throughout), but a HANDFUL of genuinely
+    /// expressive primary-motion epochs at the very tail of the in-bed block -- the wearer getting
+    /// up -- flipped the WHOLE-BLOCK `motionSource` verdict to `.primary`, disabling the pass
+    /// entirely even though the interior itself never had a usable primary signal
+    /// (`BulkSleep.swift:462-466` already documents this exact failure mode). This is the test
+    /// that would have caught the ship, and it must never regress silently: the premise assertion
+    /// fails loudly if the fixture stops reproducing a block-level `.primary` verdict.
+    func testGettingUpMotionDoesNotDisableTheInteriorPass() {
+        var records = night(arousalIndex: 30, arousalTailSum: 250, count: 60)
+        var c = counter(60)
+        for _ in 0..<3 {
+            records.append(mvrecMoving(c))
+            c += step
+        }
+
+        // Premise: the WHOLE-BLOCK verdict really is .primary -- proving this fixture reproduces
+        // the real failure mode, not a different one.
+        XCTAssertFalse(BulkSleep.usesMotionIntensityFallback(records),
+                       "premise failed -- the fixture must make the WHOLE block read .primary, "
+                       + "exactly as the real night did")
+
+        let segs = SleepStaging.classify(from: records)
+        XCTAssertEqual(stage(segs, at: 30), .awake,
+                       "an interior arousal must still be detected even though the block's OWN "
+                       + "getting-up tail flips the whole-block motion-source verdict to .primary")
+    }
 }
