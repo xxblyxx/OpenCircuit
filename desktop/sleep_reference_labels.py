@@ -364,6 +364,90 @@ def compare_own(labels, store_path, tz):
                   f"{(in_bed_end - in_bed_start) / 3600:.1f}h night -- every awake minute is an edge segment")
 
 
+# --------------------------------------------------------------------------- --sweep-arousal-cut
+#
+# Fits `SleepStaging.Tuning.arousalIntensityCut` (docs/SLEEP_INTERIOR_AROUSALS.md §4) WITHOUT
+# re-implementing all of `classifyContiguous` in Python: `markInteriorArousals` is purely additive
+# and, by construction, never moves onset/finalWake (that's its whole safety argument -- see the
+# Swift doc comment). So a candidate cut's effect can be simulated by taking the ALREADY-COMMITTED
+# onset/finalWake from the stored hypnogram (which the pass would leave untouched) and scanning
+# fresh archive tail sums strictly inside that fixed window -- exactly what the pass itself does.
+
+def load_own_night_bounds(store_path):
+    """[(inBedStart, inBedEnd, onset|None, finalWake|None), ...] -- onset/finalWake via the same
+    min/max-of-asleep-segment rule `compute_awakenings` uses, so the sweep's fixed window matches
+    what `classify()` already committed to."""
+    out = []
+    for in_bed_start, in_bed_end, segments in load_own_nights(store_path):
+        asleep = [(s, e) for s, e, st in segments if st in ("light", "deep", "rem")]
+        if not asleep:
+            out.append((in_bed_start, in_bed_end, None, None))
+            continue
+        out.append((in_bed_start, in_bed_end, min(s for s, e in asleep), max(e for s, e in asleep)))
+    return out
+
+
+def sweep_arousal_cut(labels, store_path, archives, tz, cuts):
+    bounds = load_own_night_bounds(store_path)
+    if not bounds:
+        print("\nno stored nights to sweep")
+        return
+    sources = sorted({src for src, s, e, st in labels})
+    all_recs = [r for recs in archives.values() for r in recs]
+    print(f"\n--- arousal-cut sweep (docs/SLEEP_INTERIOR_AROUSALS.md §4) ---")
+    print("simulates markInteriorArousals: tail sums re-scanned fresh from the pulled archive "
+          "inside a FIXED [onset, finalWake] window (the pass never moves that window)")
+    for in_bed_start, in_bed_end, our_onset, our_final_wake in bounds:
+        print(f"\nnight {fmt(in_bed_start, tz)} .. {fmt(in_bed_end, tz)}")
+        if our_onset is None:
+            print("  no asleep segments stored -- skipping")
+            continue
+        # ⚠️ FITTING WINDOW vs SHIPPING WINDOW. Production always uses OUR OWN onset/finalWake --
+        # that is what markInteriorArousals actually gets handed and is correct BY CONSTRUCTION
+        # (the pass's whole safety argument is that it never moves them). But for CHOOSING the cut,
+        # our own onset can itself be wrong (a SEPARATE, pre-existing bug this plan does not touch:
+        # 🟢 measured 2026-08-15, our stored onset for 08-14/15 was 74.8 min EARLIER than Whoop's,
+        # 22:16 vs 23:31 -- the classifier called "asleep" while the wearer was still visibly moving
+        # getting into bed per the tail data). Fitting against that window would count real
+        # getting-into-bed motion as "arousals" and inflate every cut's count roughly equally. So:
+        # prefer a reference source's OWN asleep-labelled span for THIS night when one exists (a
+        # second, independent onset estimate); fall back to our own only when no reference covers
+        # the night. This choice affects ONLY which cut number gets picked here, never what ships.
+        onset, final_wake, window_source = our_onset, our_final_wake, "our own stored onset/wake"
+        for src in sources:
+            src_asleep = [(s, e) for s2, s, e, st in labels
+                         if s2 == src and st in ("light", "deep", "rem")
+                         and s < in_bed_end and e > in_bed_start]
+            if src_asleep:
+                onset, final_wake = min(s for s, e in src_asleep), max(e for s, e in src_asleep)
+                window_source = f"{src}'s own labelled onset/wake"
+                break
+        if (onset, final_wake) != (our_onset, our_final_wake):
+            print(f"  fitting window: {window_source} ({fmt(onset, tz)} .. {fmt(final_wake, tz)}) -- "
+                  f"our own stored onset differs by {(our_onset - onset) / 60:+.1f} min")
+        else:
+            print(f"  fitting window: {window_source} ({fmt(onset, tz)} .. {fmt(final_wake, tz)})")
+        interior = sorted((r for r in all_recs if onset < r.time < final_wake), key=lambda r: r.time)
+        if not interior:
+            print("  no raw epochs in the pulled archive for this night (outside ~30h retention)")
+            continue
+        for src in sources:
+            count = sum(1 for s2, s, e, st in labels
+                       if s2 == src and st == "awake" and s < final_wake and e > onset)
+            print(f"    {src} reference awake intervals in this window: {count}")
+        print(f"    {'cut':>6}{'count':>8}{'waso(min)':>11}")
+        for cut in cuts:
+            hits = [r.time for r in interior if sum(r.intensity_tail) >= cut]
+            merged = []
+            for t in hits:
+                if merged and t <= merged[-1][1] + MERGE_TOLERANCE_SECONDS:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], t + 150))
+                else:
+                    merged.append((t, t + 150))
+            waso = sum(e - s for s, e in merged) / 60
+            print(f"    {cut:>6}{len(merged):>8}{waso:>10.1f}m")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -380,6 +464,11 @@ def main():
                     help="reproduce SLEEP_AWAKE_RESOLUTION §4.1: our own interior/edge awake "
                          "split per stored night, beside each reference source's awake total "
                          "(needs the SwiftData store -- pulled automatically with --pull)")
+    ap.add_argument("--sweep-arousal-cut", nargs="?", const="", metavar="C1,C2,...",
+                    help="fit Tuning.arousalIntensityCut (SLEEP_INTERIOR_AROUSALS.md §4): "
+                         "simulate markInteriorArousals at each comma-separated cut and print "
+                         "the resulting awakening count per stored night. Bare flag (no value) "
+                         "uses the default sweep: 345,300,250,200,150,120,100,75,50")
     ap.add_argument("--source", help="restrict to one source name (e.g. WHOOP)")
     args = ap.parse_args()
 
@@ -405,6 +494,11 @@ def main():
 
     if args.compare_own:
         compare_own(labels, args.dir / STORE_NAME, tz)
+
+    if args.sweep_arousal_cut is not None:
+        cuts = ([int(c.strip()) for c in args.sweep_arousal_cut.split(",")] if args.sweep_arousal_cut
+                else [345, 300, 250, 200, 150, 120, 100, 75, 50])
+        sweep_arousal_cut(labels, args.dir / STORE_NAME, load_archives(prefs), tz, cuts)
 
     if not labels:
         return
