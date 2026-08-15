@@ -99,8 +99,62 @@ there is no denominator.
   needs revisiting.
 - check-after: 2026-08-21
 
+### The reference-label corpus has one usable night, and the archive rolls over nightly
+- id: sleep-reference-label-corpus
+- shipped: branch `feat/sleep-awake-diagnostics` 2026-08-15 — `ExternalSleepSample`,
+  `HealthKitWriter.readExternalSleepSamples`, `ExternalSleepStore`, Device Info → Diagnostics →
+  "Import reference sleep labels", `desktop/sleep_reference_labels.py`. Analysis-only; no
+  classifier constant changed.
+- claim: reference labels (Whoop / the official RingConn app, read from HealthKit) plus raw epochs
+  give a corpus that can FIT the staging thresholds in `docs/SLEEP_AWAKE_RESOLUTION.md` §10
+- needs: nights where BOTH exist. `EpochArchive` retains ~30 h of raw epochs while the labels span
+  30 days, so a label is only usable if the archive was pulled within ~30 h of that night.
+- blocked-because: measured 2026-08-15 — 24 nights of RingConn labels have NO surviving raw epochs;
+  of 3 Whoop nights only 08-14/15 does. Every finding in §4.4 therefore rests on ONE night
+  (n = 43 awake epochs). Nothing is wrong with the tooling; the archive simply rolls over faster
+  than labels accumulate, so each day without a paired capture discards a night permanently.
+- check: `desktop/sleep_reference_labels.py --pull` then `--correlate`; count nights where labels
+  and epochs overlap (the tool prints the traced night's span and the label span)
+- passes-if: ≥ 7 paired nights exist, AND the §4.4 co-location lift holds at ≥ 1.5× when pooled
+  across them. Fewer than 7, or a lift that collapses toward 1.0, means the single-night result was
+  small-sample noise and §10 option B must not proceed on it.
+- check-after: 2026-08-29
+
+### The intensity tail's arousal signal is one night, with autocorrelated epochs
+- id: sleep-tail-encodes-arousal
+- shipped: measured 2026-08-15, recorded in `docs/SLEEP_AWAKE_RESOLUTION.md` §4.4 (no code depends
+  on it yet — this is the claim that would JUSTIFY option A/B, so it must hold before either lands)
+- claim: a non-zero `[15:20]` intensity tail is enriched inside labelled-awake epochs — 48.8 % vs
+  26.0 %, 1.88× lift, Fisher exact two-sided p = 0.0054 — i.e. the tail carries arousal
+  information, which `PROTOCOL.md` marks 🔴 not established
+- needs: more paired label+epoch nights (see `sleep-reference-label-corpus`), and ideally a night
+  with labels from BOTH sources to check the effect is not Whoop-specific
+- blocked-because: n = 1 night / 43 awake epochs. Adjacent epochs are autocorrelated, so the
+  effective sample is smaller than 239 and the stated p is optimistic. The two label sources have
+  ZERO overlapping nights (RingConn app stopped writing 08-12, Whoop started 08-12), so no
+  cross-source check is possible from the current data at all.
+- check: `desktop/sleep_reference_labels.py --pull --correlate` once ≥ 7 paired nights exist;
+  pool the 2×2 across nights rather than averaging per-night lifts
+- passes-if: pooled lift ≥ 1.5× with the enrichment present on a majority of individual nights. A
+  pooled lift driven by one outlier night fails this — the point is that the tail is reliably
+  informative, not that it was once.
+- check-after: 2026-08-29
+
 ---
 
 ## Settled
+
+### `sleep_awake_trace.py` correctly attributes why a known awakening is dropped — 2026-08-15
+- id: sleep-brief-awakenings-visible
+- was: does the per-epoch trace correctly explain why a specific known awakening does or doesn't
+  survive `SleepStaging`'s awake mask, including whether the primary motion channel was usable?
+- observed: run against the 2026-08-14/15 night with 19 Whoop-labelled awake intervals. The trace
+  located every one, and the explanation held: all 19 are shorter than the 12.5 min
+  `erodeShortHRWake` floor and 11 are shorter than a single 150 s epoch, so both mechanism #1 and
+  mechanism #4 of §2 independently account for the loss. **It also caught two errors in its own
+  first draft** (`SLEEP_AWAKE_RESOLUTION.md` §7): the motion-source verdict was being scored on the
+  strict sleep window, making a healthy channel read as "constant filler" and engaging a fallback
+  the shipped classifier would not use; and `intensity_tail` read 7 bytes where Swift's
+  `motionIntensityTail` reads 5. Both fixed. The tool answers "why not" correctly.
 
 _Nothing yet. Entries land here with the date and what was actually observed._

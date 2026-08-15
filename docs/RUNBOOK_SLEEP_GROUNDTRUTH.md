@@ -1,5 +1,24 @@
 # Runbook — capture RingConn's computed hypnogram (sleep ground truth)
 
+> ## ⚠️ LARGELY SUPERSEDED for label capture (2026-08-15) — try the one-tap route first
+>
+> The official RingConn app writes its computed hypnogram **into Apple Health**, so the whole
+> mitmproxy + Frida pinning-bypass procedure below is unnecessary when the wearer has run that app
+> on the phone. 🟢 MEASURED: Device Info → Diagnostics → **Import reference sleep labels**
+> retrieved **24 nights / 190 awake intervals** of RingConn's own algorithm on the wearer's own
+> ring, with no interception at all. See `docs/SLEEP_AWAKE_RESOLUTION.md` §4.3 and §8, and read
+> them with `desktop/sleep_reference_labels.py` (`--export-groundtruth` emits the same
+> `sleepPhases` shape `ringconn_sleep_fit.py --groundtruth` already consumes, so the fitting half
+> of this runbook still applies verbatim).
+>
+> **This runbook remains the only route when** the wearer never ran the official app (nothing was
+> ever written to HealthKit), or the labels needed predate the app's HealthKit sync being enabled.
+>
+> ⚠️ Whichever route supplies the labels, the binding constraint is the SAME and is not solved by
+> either: `EpochArchive` retains ~30 h of raw epochs, so a label is only fittable if the archive
+> was pulled within ~30 h of that night. 24 of the 24 RingConn nights above have **no surviving raw
+> epochs**. See `docs/PENDING_VALIDATION.md` → `sleep-reference-label-corpus`.
+
 Goal: capture the **per-epoch sleep stages RingConn computes on-device** so we can FIT
 our staging to reproduce them. RingConn runs its hypnogram algorithm on the ring, syncs
 the result to its cloud, and the app fetches it back as a `sleepPhases` JSON array. We
