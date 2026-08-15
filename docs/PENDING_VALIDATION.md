@@ -140,33 +140,40 @@ there is no denominator.
   informative, not that it was once.
 - check-after: 2026-08-29
 
-### arousalIntensityCut (200) is fitted on ONE night, and hasn't been checked against a real re-staged night at all
+### arousalIntensityCut (200) is fitted on ONE night, and hasn't been checked against a real re-staged night with the working code
 - id: sleep-arousal-cut-single-night-fit
 - shipped: `feat/sleep-awake-diagnostics` 2026-08-15 — `SleepStaging.Tuning.arousalIntensityCut`
-  (`markInteriorArousals`, `docs/SLEEP_INTERIOR_AROUSALS.md`). Ships live: this DOES change
+  (`markInteriorArousals`, `docs/SLEEP_INTERIOR_AROUSALS.md` §1b). Ships live: this DOES change
   classifier output on any night using the intensity-tail fallback path.
 - claim: `arousalIntensityCut = 200` produces 5–8 interior awakenings/night — RingConn's own
   5.8/night average — without moving onset or final wake, on real nights generally (not just the
   one it was fitted on)
-- needs: (a) at least one night the ring has ACTUALLY re-staged with this code (the three nights
-  stored before this shipped keep their pre-fix hypnograms until the ring syncs fresh data — there
-  is no re-stage-on-demand action), and (b) ideally several more paired label+epoch nights (see
+- needs: (a) at least one night the ring has re-staged WITH THE §1b FIX (the whole-block-vs-interior
+  motion-source bug), and (b) ideally several more paired label+epoch nights (see
   `sleep-reference-label-corpus`) so the fit isn't resting on the single 2026-08-14/15 night it was
   chosen from
-- blocked-because: shipped and installed 2026-08-15 but the ring has not synced since — every claim
-  in `docs/SLEEP_INTERIOR_AROUSALS.md` §4/§5 is either a unit test on synthetic fixtures or a
-  desktop SIMULATION (`--sweep-arousal-cut`) against archived bytes, never the live classifier
-  running on a real night end to end
-- check: `desktop/sleep_reference_labels.py --pull --compare-own` the morning after a real sync;
-  separately, `desktop/sleep_reference_labels.py --pull --sweep-arousal-cut` on new paired nights
-  as they accumulate, to see whether 200 still lands in range or needs re-fitting
-- passes-if: the newly-staged night's OC interior column in `--compare-own` shows a nonzero,
+- blocked-because: 🟢 MEASURED same day — the FIRST re-stage attempt (force-quit + Bluetooth
+  toggle, confirmed via `ZUPDATEDAT` moving to 08-15 16:36:16) proved the app DOES re-stage from
+  the persisted archive on reconnect without waiting for a fresh overnight sync
+  (`RingSession.restageFromArchive`), but it ALSO proved the shipped pass was inert: the interior
+  column stayed exactly `0.0m`, byte-identical to before the fix. Root cause found and fixed same
+  day (§1b: the channel-selection verdict was scoped to the whole in-bed block, where 3 real
+  getting-up epochs disqualified it, rather than the sleep interior). The re-stage mechanism is
+  no longer the blocker — only a re-run WITH the fix installed is.
+- check: force-quit the app, toggle Bluetooth off/on, reopen (triggers a fresh
+  `restageFromArchive` — no need to wait for an overnight sync), then
+  `desktop/sleep_reference_labels.py --pull --compare-own`; separately,
+  `desktop/sleep_reference_labels.py --pull --sweep-arousal-cut` on new paired nights as they
+  accumulate, to see whether 200 still lands in range or needs re-fitting
+- passes-if: the re-staged night's OC interior column in `--compare-own` shows a nonzero,
   plausible awakening count (roughly 0–15 min per awakening, total WASO not wildly larger than the
-  night's total awake time), AND the in-bed window / onset / final wake match what a human would
-  expect from that night (sanity-checked against the wearer's own recollection, same as this
-  whole investigation started). A flat 0.0m again means the pass didn't fire (channel or cut
-  problem); an implausibly large WASO means the strictly-interior guard didn't hold.
-- check-after: 2026-08-16 (the next morning this ring is worn overnight)
+  night's total awake time), AND the in-bed window is unchanged at exactly
+  `08-14 22:15:56 .. 08-15 08:23:26` (moving means the strictly-interior guard leaked). A flat
+  0.0m again means either a NEW variant of the channel-selection bug, or that this specific
+  night's interior itself now includes real primary motion (in which case §1b's own documented
+  "known limitation" is the explanation, not a new bug).
+- check-after: 2026-08-15 (same day — no longer needs to wait for morning; a forced reconnect is
+  sufficient, see `check` above)
 
 ---
 
