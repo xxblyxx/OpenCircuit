@@ -81,10 +81,12 @@ SLEEPTYPE_MAP = {
 @dataclass
 class Tuning:
     # --- These fields mirror Swift SleepStaging.Tuning one-for-one (same defaults) ------
-    #     NOTE: Swift has since grown passes this port does NOT yet mirror
-    #     (markLeadInWakeOnset, rescueSecondBoutHRWake, motionAwakeVitalsHalfWindow,
-    #     minConsolidatedSleepEpochs, deepBaselineMarginBPM, preOnsetBedtime*). Pre-existing
-    #     drift — fits are approximate for nights those passes touch.
+    #     NOTE: markLeadInWakeOnset, rescueSecondBoutHRWake, motionAwakeVitalsHalfWindow and
+    #     protectsLeadingHRWake are now ported (below). Swift has since grown MORE passes this
+    #     port still does NOT mirror — deepBaselineMarginBPM, preOnsetBedtime*, and the
+    #     SpO2-cadence wake offset (markCadenceWakeOffset / cadenceWakeQuietEpochs). Those need
+    #     a personal baseline / record-template info the CSV feature format doesn't carry, so
+    #     they stay documented drift — fits are approximate for nights those passes touch.
     awakeMotion: int = 15
     deepHRPercentile: float = 0.42
     remHRPercentile: float = 0.86
@@ -102,8 +104,22 @@ class Tuning:
     hrWakeHalfWindow: int = 2
     onsetSustainEpochs: int = 6
     minHRWakeRunEpochs: int = 5
+    # Exempts the awake run that OPENS the fragment from erosion (#202 — erosion repairs a hole
+    # PUNCHED IN sleep; the head run has no sleep before it, so eroding it manufactures onset out
+    # of the pre-sleep wind-down instead). Mirrors Swift one-for-one.
+    protectsLeadingHRWake: bool = True
+    # Second-bout HR-wake rescue ("sleep never continues after a mid-night wake" fix). Mirrors
+    # Swift one-for-one; hrWakeRescueVitalsFraction (below) is its (e) guard.
+    hrWakeRescueCeilingBPM: float = 25.0
+    # Motion-awake softening half-window: an epoch within this many epochs of a raw (non-forward-
+    # filled) sleep-vitals read AND below the wake threshold reads as moving-but-asleep rather
+    # than motion-awake, but ONLY across the morning tail (after the last sustained asleep run) —
+    # mirrors Swift's `windowedVitalsCoverage` + tailStart gating one-for-one. 0 disables it.
+    motionAwakeVitalsHalfWindow: int = 3
     # Descent-relative onset trim (the "mild wind-down" fix) — mirrors Swift one-for-one.
-    onsetSettleFraction: float = 0.35
+    # Swift ships 0.60 (calibrated 2026-07-16 against two ground-truthed late-onset nights); this
+    # port had drifted to the pre-calibration 0.35 — corrected to match.
+    onsetSettleFraction: float = 0.60
     onsetMinDescentBPM: float = 10.0
     onsetScanEpochs: int = 12
     onsetSearchEpochs: int = 48
@@ -131,7 +147,8 @@ class Tuning:
         "remVarPercentile", "variabilityHalfWindow", "deepVarFloor", "remVarFloor",
         "minDeepRunEpochs", "minREMRunEpochs", "minAwakeRunEpochs", "hrvVarWeight",
         "sleepFloorPercentile", "wakeHRMarginBPM", "hrWakeHalfWindow",
-        "onsetSustainEpochs", "minHRWakeRunEpochs",
+        "onsetSustainEpochs", "minHRWakeRunEpochs", "protectsLeadingHRWake",
+        "hrWakeRescueCeilingBPM", "motionAwakeVitalsHalfWindow",
         "onsetSettleFraction", "onsetMinDescentBPM", "onsetScanEpochs", "onsetSearchEpochs",
         "offsetNoReturnSpreadFraction", "offsetNoReturnMinMarginBPM",
     )
@@ -447,8 +464,10 @@ def filled_forward(xs):
     return out
 
 
-def _erode_short_hr_wake(awake, motion_awake, min_run):
-    """Port of SleepStaging.erodeShortHRWake (mutates `awake`)."""
+def _erode_short_hr_wake(awake, motion_awake, min_run, protects_leading=True):
+    """Port of SleepStaging.erodeShortHRWake (mutates `awake`). The head run (i == 0) is exempt
+    when `protects_leading`: no sleep precedes it, so eroding it manufactures onset rather than
+    repairing a hole (#202)."""
     n = len(awake)
     i = 0
     while i < n:
@@ -460,10 +479,96 @@ def _erode_short_hr_wake(awake, motion_awake, min_run):
             j += 1
         run = j - i + 1
         has_motion = any(motion_awake[k] for k in range(i, j + 1))
-        if run < min_run and not has_motion:
+        opens_the_block = protects_leading and i == 0
+        if run < min_run and not has_motion and not opens_the_block:
             for k in range(i, j + 1):
                 awake[k] = False
         i = j + 1
+
+
+def _windowed_vitals_coverage(has_vitals, half_window):
+    """Port of SleepStaging.windowedVitalsCoverage: true when a raw sleep-vitals epoch sits
+    within `half_window` epochs on either side. `half_window <= 0` disables it (all False)."""
+    n = len(has_vitals)
+    if half_window <= 0:
+        return [False] * n
+    out = [False] * n
+    for i in range(n):
+        s, e = max(0, i - half_window), min(n - 1, i + half_window)
+        out[i] = any(has_vitals[k] for k in range(s, e + 1))
+    return out
+
+
+def _rescue_second_bout_hr_wake(awake, sm_hr, motion_awake, vitals, floor, t):
+    """Port of SleepStaging.rescueSecondBoutHRWake (mutates `awake`): relabel a long, motion-free,
+    HR-only awake stretch back to asleep when a consolidated sleep bout already lies behind it —
+    the ADD-only counterpart to `_erode_short_hr_wake`. Returns the last index it flipped
+    (asleep-again), or None, so the offset pass can be told not to cut before it."""
+    if t.hrWakeRescueCeilingBPM <= 0:
+        return None
+    ceiling = floor + t.hrWakeRescueCeilingBPM
+    n = len(awake)
+    last_rescued = None
+    i = 0
+    while i < n:
+        if not (awake[i] and not motion_awake[i] and sm_hr[i] < ceiling):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and awake[j + 1] and not motion_awake[j + 1] and sm_hr[j + 1] < ceiling:
+            j += 1
+        run = j - i + 1
+        longest_prior = prior = 0
+        for k in range(i):
+            if awake[k]:
+                prior = 0
+            else:
+                prior += 1
+                longest_prior = max(longest_prior, prior)
+        has_sleep_behind = longest_prior >= t.minConsolidatedSleepEpochs
+        vitals_count = sum(1 for k in range(i, j + 1) if vitals[k])
+        vitals_fraction = vitals_count / run
+        if run >= t.minHRWakeRunEpochs and has_sleep_behind and vitals_fraction >= t.hrWakeRescueVitalsFraction:
+            for k in range(i, j + 1):
+                awake[k] = False
+            last_rescued = j
+        i = j + 1
+    return last_rescued
+
+
+def _mark_lead_in_wake_onset(awake, t):
+    """Port of SleepStaging.markLeadInWakeOnset (mutates `awake`): if a sustained awake block
+    still lies ahead within the onset search window, and no real sleep preceded it, sleep hasn't
+    begun yet — push onset past the END of that block."""
+    n = len(awake)
+    limit = min(t.onsetSearchEpochs, n)
+    if limit <= 0:
+        return
+    block_start = block_end = None
+    i = 0
+    while i < limit:
+        if not awake[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and awake[j + 1]:
+            j += 1
+        if j - i + 1 >= t.onsetSustainEpochs:
+            block_start, block_end = i, j
+        i = j + 1
+    if block_start is None:
+        return
+    longest = run = 0
+    for k in range(block_start):
+        if awake[k]:
+            run = 0
+        else:
+            run += 1
+            longest = max(longest, run)
+    if longest >= t.minConsolidatedSleepEpochs:
+        return
+    for k in range(block_end + 1):
+        awake[k] = True
 
 
 def _mark_descent_onset_awake(awake, sm_hr, motion_awake, floor, t):
@@ -498,19 +603,22 @@ def _mark_descent_onset_awake(awake, sm_hr, motion_awake, floor, t):
             awake[k] = True
 
 
-def _mark_point_of_no_return_offset(awake, sm_hr, hr, vitals, floor, t):
+def _mark_point_of_no_return_offset(awake, sm_hr, hr, vitals, floor, t, not_before=None):
     """Port of SleepStaging.markPointOfNoReturnOffset (mutates `awake`): mark the trailing
     "HR rose and never returned to the sleeping floor" run as awake.
 
     Margin is DERIVED from the night's own sleeping-HR spread (median - floor), never absolute.
-    Guards, all mirroring Swift: suffix-by-construction; refuses to reach the onset; bounded to
-    the last onsetSearchEpochs; reverts unless a CONSOLIDATED run survives; and a TERMINAL-REM
-    guard requiring the suffix's sleep-vitals share to be materially thinner than the sleep
-    behind it (HR alone cannot tell a final REM period from a quiet wake).
+    Guards, all mirroring Swift: suffix-by-construction; refuses to reach the onset OR before
+    `not_before` (the last epoch `_rescue_second_bout_hr_wake` or the motion-awake vitals
+    softening reclaimed — the two ADD-only passes this one must not overturn); bounded to the
+    last onsetSearchEpochs; reverts unless a CONSOLIDATED run survives; and a TERMINAL-REM guard
+    requiring the suffix's sleep-vitals share to be materially thinner than the sleep behind it
+    (HR alone cannot tell a final REM period from a quiet wake).
 
-    DIVERGENCE: Swift also passes `notBefore` = the last epoch rescueSecondBoutHRWake or the
-    motion-awake vitals softening reclaimed. Neither pass is ported here, so this is MORE
-    aggressive than Swift on mid-night-wake nights; treat a fitted fraction as an upper bound.
+    DIVERGENCE: this port still lacks the motion-awake vitals softening itself (folded into
+    `classify_prepared` separately), and `markCadenceWakeOffset` (the SpO2-duty-cycle wake
+    locator, #190) is not ported — treat a fitted offset as an upper bound on nights that pass
+    would otherwise catch.
     """
     if t.offsetNoReturnSpreadFraction <= 0 or not awake or len(sm_hr) != len(awake):
         return
@@ -521,7 +629,7 @@ def _mark_point_of_no_return_offset(awake, sm_hr, hr, vitals, floor, t):
     spread = max(0.0, percentile(sorted(hr), 0.50) - floor)
     margin = max(t.offsetNoReturnMinMarginBPM, t.offsetNoReturnSpreadFraction * spread)
     search_floor = len(awake) - min(t.onsetSearchEpochs, len(awake))
-    earliest = max(lo, search_floor)
+    earliest = max(lo, search_floor, lo if not_before is None else not_before)
     threshold = floor + margin
     start = None
     suffix_min = float("inf")
@@ -604,10 +712,11 @@ class PreparedFragment:
     """Per-fragment rows after motion-block detection + forward-fill (Tuning-free)."""
     counters: list
     hr: list
-    hrv: list   # float | None
-    rr: list    # float | None
+    hrv: list   # float | None, forward-filled (for the variability blend)
+    rr: list    # float | None, forward-filled
     spo2: list  # float | None
     motion_sum: list
+    vitals_raw: list  # bool — RAW (non-forward-filled) "this epoch carried sleep-vitals HRV"
 
 
 def prepare_night(epochs):
@@ -626,11 +735,12 @@ def prepare_night(epochs):
         in_block = sorted([e for e in frag if bstart <= e.time <= bend],
                           key=lambda e: e.counter)
         last_hr = last_hrv = last_rr = None
-        pf = PreparedFragment([], [], [], [], [], [])
+        pf = PreparedFragment([], [], [], [], [], [], [])
         for e in in_block:
             if e.hr is not None:
                 last_hr = e.hr
-            if e.hrv is not None and e.hrv > 0:
+            raw_vitals = e.hrv is not None and e.hrv > 0
+            if raw_vitals:
                 last_hrv = e.hrv
             if e.rr is not None and e.rr > 0:
                 last_rr = e.rr
@@ -643,6 +753,7 @@ def prepare_night(epochs):
             pf.rr.append(last_rr)
             pf.spo2.append(e.spo2)
             pf.motion_sum.append(m)
+            pf.vitals_raw.append(raw_vitals)
         if len(pf.counters) >= 2:
             out.append(pf)
     return out
@@ -664,6 +775,47 @@ def _variability(pf, t):
     return var
 
 
+def _compute_awake_mask(pf, t):
+    """The awake-mask half of SleepStaging.classifyContiguous (Swift lines 749-839), shared by
+    `classify_prepared` and `baseline_band_pool` so the two can't drift apart. Returns
+    (awake, sm_hr, sleep_floor, not_before) — `not_before` is the last index the second-bout
+    rescue or the tail vitals-softening reclaimed, for `_mark_point_of_no_return_offset`."""
+    hr = pf.hr
+    n = len(hr)
+    sleep_floor = percentile(sorted(hr), t.sleepFloorPercentile)
+    wake_threshold = sleep_floor + t.wakeHRMarginBPM
+    sm_hr = rolling_median(hr, t.hrWakeHalfWindow)
+
+    motion_awake_strict = [pf.motion_sum[i] > t.awakeMotion for i in range(n)]
+    awake_strict = [sm_hr[i] >= wake_threshold or motion_awake_strict[i] for i in range(n)]
+    if t.motionAwakeVitalsHalfWindow > 0:
+        strict_span = _sleep_span(awake_strict, t.onsetSustainEpochs)
+        tail_start = (strict_span[1] + 1) if strict_span is not None else n
+    else:
+        tail_start = n
+    vitals_nearby = _windowed_vitals_coverage(pf.vitals_raw, t.motionAwakeVitalsHalfWindow)
+    motion_awake = []
+    for i in range(n):
+        soften_tail = i >= tail_start and vitals_nearby[i] and sm_hr[i] < wake_threshold
+        motion_awake.append(motion_awake_strict[i] and not soften_tail)
+
+    awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
+    _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs, t.protectsLeadingHRWake)
+    last_rescued = _rescue_second_bout_hr_wake(awake, sm_hr, motion_awake, pf.vitals_raw,
+                                               sleep_floor, t)
+    last_vitals_softened = None
+    for i in range(n):
+        if motion_awake_strict[i] and not motion_awake[i]:
+            last_vitals_softened = i
+    not_before = max((v for v in (last_rescued, last_vitals_softened) if v is not None), default=None)
+
+    _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
+    _mark_lead_in_wake_onset(awake, t)
+    _mark_point_of_no_return_offset(awake, sm_hr, hr, [v is not None for v in pf.hrv], sleep_floor,
+                                    t, not_before=not_before)
+    return awake, sm_hr, sleep_floor, not_before
+
+
 def classify_prepared(pf, t, band_pool=None):
     """Tuning-dependent decision over one PreparedFragment. Returns {counter -> class}.
 
@@ -676,15 +828,7 @@ def classify_prepared(pf, t, band_pool=None):
     hr = pf.hr
     n = len(hr)
     var = _variability(pf, t)
-
-    sleep_floor = percentile(sorted(hr), t.sleepFloorPercentile)
-    wake_threshold = sleep_floor + t.wakeHRMarginBPM
-    sm_hr = rolling_median(hr, t.hrWakeHalfWindow)
-    motion_awake = [pf.motion_sum[i] > t.awakeMotion for i in range(n)]
-    awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
-    _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
-    _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
-    _mark_point_of_no_return_offset(awake, sm_hr, hr, [v is not None for v in pf.hrv], sleep_floor, t)
+    awake, sm_hr, sleep_floor, _ = _compute_awake_mask(pf, t)
 
     span = _sleep_span(awake, t.onsetSustainEpochs)
     if span is None:
@@ -756,16 +900,8 @@ def baseline_band_pool(nights_prepared, t):
     hr_all, var_all = [], []
     for prepared in nights_prepared:
         for pf in prepared:
-            n = len(pf.hr)
             var = _variability(pf, t)
-            sleep_floor = percentile(sorted(pf.hr), t.sleepFloorPercentile)
-            wake_threshold = sleep_floor + t.wakeHRMarginBPM
-            sm_hr = rolling_median(pf.hr, t.hrWakeHalfWindow)
-            motion_awake = [pf.motion_sum[i] > t.awakeMotion for i in range(n)]
-            awake = [sm_hr[i] >= wake_threshold or motion_awake[i] for i in range(n)]
-            _erode_short_hr_wake(awake, motion_awake, t.minHRWakeRunEpochs)
-            _mark_descent_onset_awake(awake, sm_hr, motion_awake, sleep_floor, t)
-            _mark_point_of_no_return_offset(awake, sm_hr, pf.hr, [v is not None for v in pf.hrv], sleep_floor, t)
+            awake, _, _, _ = _compute_awake_mask(pf, t)
             span = _sleep_span(awake, t.onsetSustainEpochs)
             if span is None:
                 continue
@@ -1040,7 +1176,7 @@ def print_metrics(title, metrics):
 
 
 def swift_initializer(t):
-    """Emit a paste-ready Swift SleepStaging.Tuning(...) for the 21 mirrored fields."""
+    """Emit a paste-ready Swift SleepStaging.Tuning(...) for the 26 mirrored fields."""
     def fmt(v):
         if isinstance(v, bool):
             return "true" if v else "false"
