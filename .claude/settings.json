@@ -10,6 +10,27 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "startup|clear|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/usage-guard.py\" --mode session 2>/dev/null || true",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/usage-guard.py\" --mode prompt 2>/dev/null || true",
+            "timeout": 20
+          }
+        ]
       }
     ]
   }
