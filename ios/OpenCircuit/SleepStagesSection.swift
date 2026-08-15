@@ -69,6 +69,12 @@ struct SleepStagesSection: View {
 
     private var shares: [SleepStageBreakdown.StageShare] { SleepStageBreakdown.breakdown(minutes) }
 
+    /// WASO + awakening count, derived from `segments` on every render — nothing is stored
+    /// (docs/SLEEP_AWAKENING_METRICS.md §2.1). Split out from the single pooled `awake` scalar
+    /// `shares` reports, so a quiet pre-sleep/post-wake night and a fragmented one no longer look
+    /// identical on the card.
+    private var awakenings: SleepAwakenings { SleepAwakenings.from(segments: segments) }
+
     private var chartAccessibilitySummary: String {
         shares.map { "\(stageDisplayName($0.stage)) \(SleepStageBreakdown.durationText(minutes: $0.minutes))" }
             .joined(separator: ", ")
@@ -336,6 +342,10 @@ struct SleepStagesSection: View {
 
     private var statRows: some View {
         VStack(alignment: .leading, spacing: 16) {
+            // Deliberately no reference-range band (docs/SLEEP_AWAKENING_METRICS.md §2.2) — unlike
+            // the stage shares below, there is no sourced population norm for awakening COUNT to
+            // cite, and a made-up one would misrepresent this as validated the way it isn't.
+            AwakeningsStatRow(awakenings: awakenings)
             ForEach(shares, id: \.stage) { share in
                 StageStatRow(share: share, name: stageDisplayName(share.stage),
                             color: stageColor(share.stage),
@@ -592,6 +602,40 @@ private struct MovementStrip: View {
             RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 9, height: 9)
             Text(name).font(.caption2).foregroundStyle(.secondary)
         }
+    }
+}
+
+// MARK: - Awakenings row
+
+/// A single-line count + duration row, deliberately simpler than `StageStatRow` below: there is
+/// no percent-of-night fraction to plot (a count isn't a share of the night) and no reference
+/// range to cite (docs/SLEEP_AWAKENING_METRICS.md §2.2), so this skips the proportional track and
+/// tick marks entirely rather than forcing awakening count into a shape built for stage
+/// percentages.
+private struct AwakeningsStatRow: View {
+    let awakenings: SleepAwakenings
+
+    private var wasoText: String {
+        SleepStageBreakdown.durationText(minutes: awakenings.minutes.waso)
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text("Awakenings").font(.subheadline.weight(.semibold))
+            Text("\(awakenings.count)")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.stageAwake)
+            Spacer()
+            // A zero here is a real, reportable measurement (docs/SLEEP_AWAKE_RESOLUTION.md §4.1
+            // — this is precisely the number that was silently 0 on every traced night), so it is
+            // always shown, never hidden behind an empty-state placeholder. `durationText` already
+            // renders 0 minutes as "0min", so no separate zero-case branch is needed here.
+            Text("\(wasoText) WASO")
+                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Awakenings")
+        .accessibilityValue("\(awakenings.count), \(wasoText) wake after sleep onset")
     }
 }
 
