@@ -1,7 +1,9 @@
 # Plan of record — interior arousal detection (option B, narrowed)
 
-> **STATUS: PROPOSED, not built.** Implements the fix for `docs/SLEEP_AWAKE_RESOLUTION.md` §10.
-> Read §4 of that doc first. Self-contained: execute without the conversation that produced it.
+> **STATUS: BUILT (2026-08-15).** Implements the fix for `docs/SLEEP_AWAKE_RESOLUTION.md` §10.
+> `Tuning.arousalIntensityCut = 200`, shipped and installed. On-device confirmation against a
+> REAL re-staged night is still pending — see §5 item 2's note. Read §4 of
+> `docs/SLEEP_AWAKE_RESOLUTION.md` first for the motivating measurement.
 
 ## 1. What step-1 investigation established (2026-08-15)
 
@@ -133,28 +135,57 @@ Sub-epoch (30 s) motion — SLEEP_AWAKE_RESOLUTION §10 option A, the only route
 sub-2.5-min events. Also: no change to `motionIntensityActiveCut`, the HR gates, `wakeHRMarginBPM`,
 or `minHRWakeRunEpochs`.
 
-## 4. Choosing the cut
+## 4. Choosing the cut — DONE, 200 chosen
 
-Start at **200** and sweep 100…345 with §2.5, selecting for **5–8 interior awakenings per night** —
-the range RingConn's own app produced on this ring (5.8/night, 🟢 24 nights,
-SLEEP_AWAKE_RESOLUTION §4.3). Do NOT select for maximum agreement with Whoop's 19: half its events
-are sub-epoch and unreachable, so fitting to them would drive the cut into noise.
+Swept 345…50 with `desktop/sleep_reference_labels.py --sweep-arousal-cut` against the
+2026-08-14/15 night, selecting for **5–8 interior awakenings per night** — the range RingConn's
+own app produced on this ring (5.8/night, 🟢 24 nights, SLEEP_AWAKE_RESOLUTION §4.3). Did NOT
+select for maximum agreement with Whoop's 19: half its events are sub-epoch and unreachable.
 
-Record the sweep table in the `Tuning` doc comment, as the other fitted knobs in that file do.
+**A confound was found and corrected before fitting**: the sweep's first pass used OUR OWN
+stored onset, which a separate, pre-existing bug placed 74.8 min too early (22:16 vs Whoop's own
+23:31 for the same night — our classifier called "asleep" while the wearer was still visibly
+getting into bed). That inflated every cut's count by ~2 phantom "arousals" that were really just
+real pre-sleep motion. Re-fit against Whoop's OWN labelled onset/wake for that night instead
+(a second, independent onset estimate) — this affects only which cut was PICKED, never what ships
+(production always uses our own onset/finalWake, exactly as designed):
+
+| cut | awakenings | WASO |
+|---|---|---|
+| 345 | 0 | 0.0 min |
+| 300 | 1 | 2.5 min |
+| 250 | 2 | 5.0 min |
+| 230 | 2 | 10.0 min |
+| **210** | **7** | 22.5 min — closest single-night match to RingConn's 5.8/night average |
+| **200** | **8** | 30.0 min — **chosen**: top of the target band, clear of the 230→210 step |
+| 150 | 13 | 50.0 min |
+
+200 over 210: both land in range, but 210 sits right at a sharp step (230→210 jumps from 2 to 7),
+which makes it more sensitive to exactly which epochs happen to sit near the boundary on any given
+night. 200 gives the same practical result with more margin from that step.
+
+Recorded in the `Tuning.arousalIntensityCut` doc comment (`SleepStaging.swift`), which is the
+source of truth for this table going forward — update both together if this is ever re-fit.
 
 ## 5. Acceptance criteria
 
-1. `swift test` green except the one known pre-existing failure
-   (`SleepStagingTests.testMidNightWASOIsImmuneToTheRescueButTheMorningTailIsNot` — verify with
-   `git stash` against clean `master` before blaming this work).
-2. **Onset and final wake are unchanged on all three stored nights.** Check with
-   `python3 desktop/sleep_reference_labels.py --compare-own` before and after: the in-bed windows
-   in column 1 must be identical. Any movement here means the strictly-interior guard leaked.
-3. Interior awakening count moves **0 → 5–8** on the traced night (`--compare-own`, OC interior
-   column stops reading 0.0m).
-4. `arousalIntensityCut = 0` is byte-identical to today.
-5. Total sleep time falls by roughly the new WASO and no more — the reclassified minutes move from
-   sleep to awake, they are not lost.
+1. **DONE** — `swift test`: 1456 tests (7 new), same one known pre-existing failure and no others
+   (`SleepStagingTests.testMidNightWASOIsImmuneToTheRescueButTheMorningTailIsNot`; confirmed via
+   `git stash` against clean `master` earlier on this branch, unrelated to this change).
+2. **DONE algorithmically, PENDING on-device.** `testOnsetAndFinalWakeAreUnchanged` proves the
+   guarantee directly (byte-identical `sleepWindow` with the pass on vs off), and every other
+   pass/test confirms `lo`/`hi` are fixed before `markInteriorArousals` runs and never
+   recomputed after. What's still open: the app has no re-stage-on-demand action, so the THREE
+   already-stored nights keep their pre-fix hypnograms until the ring syncs fresh data and
+   `classifyContiguous` runs again with the new code — i.e. tonight's sync. Check then with
+   `python3 desktop/sleep_reference_labels.py --pull --compare-own`: the in-bed windows (column 1)
+   for any newly-staged night must match what a human would expect from that night, and the OC
+   interior column should read something in 0–15 min per awakening, not 0.0m flat.
+3. **Simulated DONE, on-device PENDING** — the same sync/re-stage gap as #2 applies: `--compare-own`
+   still reads the three pre-fix nights until fresh data arrives. `--sweep-arousal-cut` (§4) is the
+   simulated version and shows 8 at the chosen cut=200 on the one night it could check.
+4. **DONE** — `testKillSwitchIsByteIdentical`.
+5. Not yet checkable — needs a real re-staged night (see #2/#3).
 
 ## 6. After it lands
 

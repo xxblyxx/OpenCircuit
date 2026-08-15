@@ -140,6 +140,34 @@ there is no denominator.
   informative, not that it was once.
 - check-after: 2026-08-29
 
+### arousalIntensityCut (200) is fitted on ONE night, and hasn't been checked against a real re-staged night at all
+- id: sleep-arousal-cut-single-night-fit
+- shipped: `feat/sleep-awake-diagnostics` 2026-08-15 — `SleepStaging.Tuning.arousalIntensityCut`
+  (`markInteriorArousals`, `docs/SLEEP_INTERIOR_AROUSALS.md`). Ships live: this DOES change
+  classifier output on any night using the intensity-tail fallback path.
+- claim: `arousalIntensityCut = 200` produces 5–8 interior awakenings/night — RingConn's own
+  5.8/night average — without moving onset or final wake, on real nights generally (not just the
+  one it was fitted on)
+- needs: (a) at least one night the ring has ACTUALLY re-staged with this code (the three nights
+  stored before this shipped keep their pre-fix hypnograms until the ring syncs fresh data — there
+  is no re-stage-on-demand action), and (b) ideally several more paired label+epoch nights (see
+  `sleep-reference-label-corpus`) so the fit isn't resting on the single 2026-08-14/15 night it was
+  chosen from
+- blocked-because: shipped and installed 2026-08-15 but the ring has not synced since — every claim
+  in `docs/SLEEP_INTERIOR_AROUSALS.md` §4/§5 is either a unit test on synthetic fixtures or a
+  desktop SIMULATION (`--sweep-arousal-cut`) against archived bytes, never the live classifier
+  running on a real night end to end
+- check: `desktop/sleep_reference_labels.py --pull --compare-own` the morning after a real sync;
+  separately, `desktop/sleep_reference_labels.py --pull --sweep-arousal-cut` on new paired nights
+  as they accumulate, to see whether 200 still lands in range or needs re-fitting
+- passes-if: the newly-staged night's OC interior column in `--compare-own` shows a nonzero,
+  plausible awakening count (roughly 0–15 min per awakening, total WASO not wildly larger than the
+  night's total awake time), AND the in-bed window / onset / final wake match what a human would
+  expect from that night (sanity-checked against the wearer's own recollection, same as this
+  whole investigation started). A flat 0.0m again means the pass didn't fire (channel or cut
+  problem); an implausibly large WASO means the strictly-interior guard didn't hold.
+- check-after: 2026-08-16 (the next morning this ring is worn overnight)
+
 ---
 
 ## Settled
