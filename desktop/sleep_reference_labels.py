@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import plistlib
+import sqlite3
 import subprocess
 import sys
 from collections import Counter
@@ -58,6 +59,15 @@ SAMPLES_KEY = "sleep.externalSamples"
 IMPORTED_AT_KEY = "sleep.externalSamplesImportedAt"
 WINDOW_KEY = "sleep.externalSamplesWindowDays"
 
+STORE_NAME = "default.store"
+STORE_FILES = [STORE_NAME, f"{STORE_NAME}-shm", f"{STORE_NAME}-wal"]
+APPLE_EPOCH = 978_307_200   # Codable/Core Data Date -> unix (matches device_alert_audit.py)
+
+# Mirrors SleepAwakenings.mergeTolerance (ios/OpenCircuitKit/.../Analytics/SleepAwakenings.swift) --
+# two interior awake runs touching within this many seconds are ONE awakening. Keep in sync; there
+# is no shared source of truth between Swift and this file for this one constant.
+MERGE_TOLERANCE_SECONDS = 150
+
 # ExternalSleepCodec's stage codes (pinned by ExternalSleepSampleTests.testStageCodesMatchHypnogramCodec)
 STAGE_FOR_CODE = {0: "inBed", 1: "awake", 2: "light", 3: "deep", 4: "rem"}
 # The RingConn `sleepPhases` vocabulary ringconn_sleep_fit.py's --groundtruth expects.
@@ -69,16 +79,33 @@ SLEEPTYPE_FOR_STAGE = {
 
 def pull(device, outdir):
     outdir.mkdir(parents=True, exist_ok=True)
-    src = f"Library/Preferences/{PLIST_NAME}"
-    dest = outdir / PLIST_NAME
-    cmd = ["xcrun", "devicectl", "device", "copy", "from", "--device", device,
-           "--domain-type", "appDataContainer", "--domain-identifier", BUNDLE_ID,
-           "--user", "mobile", "--source", src, "--destination", str(dest)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"  ! {src}: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'failed'}")
-    else:
-        print(f"  ✓ {dest.name} ({dest.stat().st_size:,} B)")
+    # The prefs plist (reference labels) AND the SwiftData store (our own stored hypnograms,
+    # ZSTOREDSLEEPSUMMARY.ZHYPNOGRAMDATA) -- --compare-own needs both. -shm/-wal may legitimately
+    # be absent if SQLite has checkpointed, same as device_alert_audit.py's PULL_FILES.
+    #
+    # ⚠️ COPY TO A TEMP PATH, THEN SWAP. `devicectl device copy` can fail PARTWAY (🟢 measured: a
+    # "socket was closed unexpectedly" mid-transfer left a 0-byte `default.store` on disk), and
+    # writing directly to `dest` means a failed retry silently destroys a previously-good snapshot
+    # -- replacing real data with a file `sqlite3.connect` will open (empty file = valid empty DB)
+    # but that fails downstream with a confusing "no such table" instead of a clear "pull failed".
+    # A successful copy is moved into place; a failed one leaves whatever was already at `dest`
+    # untouched, so `--compare-own` on stale-but-real data beats it on none at all.
+    for name in [PLIST_NAME] + STORE_FILES:
+        src = f"Library/{'Preferences' if name == PLIST_NAME else 'Application Support'}/{name}"
+        dest = outdir / name
+        tmp = outdir / f"{name}.pulling"
+        cmd = ["xcrun", "devicectl", "device", "copy", "from", "--device", device,
+               "--domain-type", "appDataContainer", "--domain-identifier", BUNDLE_ID,
+               "--user", "mobile", "--source", src, "--destination", str(tmp)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            reason = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "failed"
+            stale = " (keeping the previous snapshot, if any)" if dest.exists() else ""
+            print(f"  ! {src}: {reason}{stale}")
+            tmp.unlink(missing_ok=True)
+        else:
+            tmp.replace(dest)
+            print(f"  ✓ {dest.name} ({dest.stat().st_size:,} B)")
 
 
 def load_labels(prefs):
@@ -215,6 +242,128 @@ def export_groundtruth(labels, path, source=None):
     print(f"  use: python3 ringconn_sleep_fit.py --features <csv> --groundtruth {path}")
 
 
+# --------------------------------------------------------------------------- --compare-own
+#
+# Reproduces docs/SLEEP_AWAKE_RESOLUTION.md §4.1's table automatically instead of by hand: for
+# each night we ourselves staged (from the SwiftData store's ZSTOREDSLEEPSUMMARY), compute the
+# same interior/edge awake split `SleepAwakenings.from` computes in Swift, and print it beside
+# each reference source's awake total for the same in-bed window. See
+# docs/SLEEP_AWAKENING_METRICS.md for the metric this ports.
+
+def load_own_nights(store_path):
+    """[(inBedStart_unix, inBedEnd_unix, [(start_unix, end_unix, stage), ...]), ...] from our own
+    stored hypnograms, oldest first. `stage` uses the same strings as `STAGE_FOR_CODE`."""
+    con = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "SELECT ZINBEDSTART, ZINBEDEND, ZHYPNOGRAMDATA FROM ZSTOREDSLEEPSUMMARY "
+            "ORDER BY ZNIGHT"
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        # A previously-failed `--pull` (or a store from before the app ever staged a night) can
+        # leave a file sqlite3 opens fine but that lacks the table -- report it plainly rather
+        # than a raw traceback (same "never trap, report clearly" stance PENDING_VALIDATION's own
+        # tooling takes).
+        print(f"!! {store_path} did not open as expected ({e}) -- re-run with --pull", file=sys.stderr)
+        return []
+    finally:
+        con.close()
+    out = []
+    for in_bed_start, in_bed_end, hyp in rows:
+        if in_bed_start is None or in_bed_end is None:
+            continue
+        segments = []
+        if hyp:
+            try:
+                triples = json.loads(bytes(hyp).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                triples = []
+            for t in triples:
+                if not (isinstance(t, list) and len(t) == 3):
+                    continue
+                start, end, code = t
+                stage = STAGE_FOR_CODE.get(code)
+                if stage is None or end <= start:
+                    continue
+                segments.append((start, end, stage))
+        out.append((in_bed_start + APPLE_EPOCH, in_bed_end + APPLE_EPOCH, segments))
+    return out
+
+
+def compute_awakenings(segments):
+    """Port of `SleepAwakenings.from` (SLEEP_AWAKENING_METRICS.md §5.1): given a night's staged
+    (start_unix, end_unix, stage) triples INCLUDING inBed, return
+    {count, waso, longest, edge_awake} in seconds. Mirrors the Swift algorithm step for step --
+    filter inBed, find onset/finalWake from asleep segments, clip awake to that window, merge runs
+    touching within `MERGE_TOLERANCE_SECONDS`."""
+    staged = [(s, e, st) for s, e, st in segments if st != "inBed"]
+    asleep_stages = {"light", "deep", "rem"}
+    asleep = [(s, e) for s, e, st in staged if st in asleep_stages]
+    if not asleep:
+        return {"count": 0, "waso": 0, "longest": 0, "edge_awake": 0}
+    onset = min(s for s, e in asleep)
+    final_wake = max(e for s, e in asleep)
+
+    awake = [(s, e) for s, e, st in staged if st == "awake"]
+    total_awake = sum(e - s for s, e in awake)
+
+    interior = []
+    for s, e in awake:
+        cs, ce = max(s, onset), min(e, final_wake)
+        if ce > cs:
+            interior.append((cs, ce))
+    interior.sort()
+
+    merged = []
+    for s, e in interior:
+        if merged and s <= merged[-1][1] + MERGE_TOLERANCE_SECONDS:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    waso = sum(e - s for s, e in merged)
+    longest = max((e - s for s, e in merged), default=0)
+    return {"count": len(merged), "waso": waso, "longest": longest,
+            "edge_awake": total_awake - waso}
+
+
+def compare_own(labels, store_path, tz):
+    """Print SLEEP_AWAKE_RESOLUTION §4.1's table: our own interior/edge awake split per night,
+    beside each reference source's awake total for the same in-bed window."""
+    if not store_path.exists():
+        print(f"\n!! {store_path} not found -- pass --pull with the phone connected over USB")
+        return
+    nights = load_own_nights(store_path)
+    if not nights:
+        print("\nno stored nights (ZSTOREDSLEEPSUMMARY is empty)")
+        return
+
+    sources = sorted({src for src, s, e, st in labels})
+    print(f"\n--- our own interior/edge awake split, per stored night (SLEEP_AWAKE_RESOLUTION §4.1) ---")
+    header = f"{'night (in-bed window)':<32}{'OC awake':>10}{'OC interior':>13}{'OC edge':>9}"
+    for src in sources:
+        header += f"{src + ' awake':>16}"
+    print(header)
+    print("-" * len(header))
+
+    for in_bed_start, in_bed_end, segments in nights:
+        result = compute_awakenings(segments)
+        oc_total_min = (result["waso"] + result["edge_awake"]) / 60
+        oc_interior_min = result["waso"] / 60
+        oc_edge_min = result["edge_awake"] / 60
+        row = (f"{fmt(in_bed_start, tz) + ' .. ' + fmt(in_bed_end, tz):<32}"
+               f"{oc_total_min:>9.1f}m{oc_interior_min:>12.1f}m{oc_edge_min:>8.1f}m")
+        for src in sources:
+            overlap_min = sum(max(0, min(e, in_bed_end) - max(s, in_bed_start))
+                              for s2, s, e, st in labels
+                              if s2 == src and st == "awake" and s < in_bed_end and e > in_bed_start) / 60
+            row += f"{overlap_min:>15.1f}m"
+        print(row)
+        if result["count"] == 0 and oc_total_min > 0:
+            print(f"    ^ {result['count']} interior awakenings on a "
+                  f"{(in_bed_end - in_bed_start) / 3600:.1f}h night -- every awake minute is an edge segment")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -227,6 +376,10 @@ def main():
                     help="test tail-vs-awake co-location over the traced night")
     ap.add_argument("--export-groundtruth", metavar="PATH",
                     help="write a RingConn-style sleepPhases JSON for ringconn_sleep_fit.py")
+    ap.add_argument("--compare-own", action="store_true",
+                    help="reproduce SLEEP_AWAKE_RESOLUTION §4.1: our own interior/edge awake "
+                         "split per stored night, beside each reference source's awake total "
+                         "(needs the SwiftData store -- pulled automatically with --pull)")
     ap.add_argument("--source", help="restrict to one source name (e.g. WHOOP)")
     args = ap.parse_args()
 
@@ -242,14 +395,19 @@ def main():
         prefs = plistlib.load(f)
 
     tz = datetime.now().astimezone().tzinfo
-    labels = load_labels(prefs)
-    report(labels, prefs, tz)
-    if not labels:
-        return
+    loaded = load_labels(prefs)
+    report(loaded, prefs, tz)   # distinguishes None (never imported) from [] (imported, empty)
+    labels = loaded or []
 
     if args.source:
         labels = [l for l in labels if l[0] == args.source]
         print(f"\nfiltered to source {args.source!r}: {len(labels)} intervals")
+
+    if args.compare_own:
+        compare_own(labels, args.dir / STORE_NAME, tz)
+
+    if not labels:
+        return
 
     # The traced night, for the interval list + correlation.
     archives = load_archives(prefs)
