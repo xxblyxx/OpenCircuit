@@ -395,6 +395,52 @@ public enum SleepStaging {
         /// therefore a synthetic unworn block over REAL night bytes, not a corpus night. See #194.
         public var stagedWearGate: Bool
 
+        // --- Interior arousal detection (the "brief mid-night awakenings never show" fix) --------
+        // `BulkSleep.motionIntensityActiveCut` (345) is calibrated for GROSS movement and 🟢 MEASURED
+        // to fire ONLY at a night's edges — 22 epochs falling asleep, 2 waking up, ZERO interior — on
+        // the 2026-08-14/15 night (docs/SLEEP_AWAKE_RESOLUTION.md §4, docs/SLEEP_INTERIOR_AROUSALS.md
+        // §1). A brief mid-night arousal sits in a lower band that cut never sees: Whoop-labelled
+        // awake epochs that night carried tail sums of 131/194/243/329/111/72/177/136/30, max 329 vs
+        // the 345 cut. This is the SECOND, lower cut for exactly that band, scoped to fire ONLY
+        // strictly inside the sleep window so it can never move onset or final wake.
+
+        /// Tail-sum cut (same raw `[15:20]` units as `BulkSleep.motionIntensityActiveCut`) above
+        /// which an epoch STRICTLY BETWEEN sleep onset and final wake counts as a brief arousal.
+        /// Deliberately far below `motionIntensityActiveCut` (345) — that cut is for gross movement
+        /// (getting into/out of bed); this one is for the much smaller stirs of a mid-night wake-up.
+        /// Applies ONLY on the intensity-tail fallback path (`BulkSleep.usesMotionIntensityFallback`)
+        /// — the primary `[10:15]` channel's magnitudes are a different scale, and a night with an
+        /// expressive primary channel does not have the interior-blindness problem this exists to fix.
+        ///
+        /// **`0` DISABLES the pass entirely — byte-identical to pre-this-feature staging** (the
+        /// regression escape hatch every other pass in this file carries).
+        ///
+        /// 🟡 FITTED ON ONE NIGHT (2026-08-14/15) against Whoop reference labels, targeting the
+        /// awakening-COUNT range (5–8/night) RingConn's own app produced on this same ring over 24
+        /// nights (5.8/night, SLEEP_AWAKE_RESOLUTION §4.3) — NOT maximum agreement with Whoop's 19,
+        /// half of which are shorter than one 150 s epoch and structurally unreachable here.
+        ///
+        /// 🟢 MEASURED sweep (`desktop/sleep_reference_labels.py --sweep-arousal-cut`), fitted
+        /// against Whoop's OWN labelled onset/wake for that night — NOT our stored onset, which a
+        /// separate, pre-existing bug placed 74.8 min too early on this night (our onset called
+        /// "asleep" while the wearer was still visibly getting into bed per the tail data; using it
+        /// would have counted that real motion as arousals and inflated every cut roughly equally):
+        ///     cut   awakenings  WASO
+        ///     345            0   0.0 min
+        ///     300            1   2.5 min
+        ///     250            2   5.0 min
+        ///     230            2  10.0 min
+        ///     210            7  22.5 min   ← RingConn's own 5.8/night average sits here
+        ///     200            8  30.0 min   ← chosen: top of the target band, and clear of the
+        ///                                     230→210 step (a small further increase would not
+        ///                                     have swung the count the way one just below it would)
+        ///     150           13  50.0 min
+        /// 200 was picked over 210 for that margin, not because it fits this one night better.
+        ///
+        /// Re-fit as paired label+epoch nights accumulate (`docs/PENDING_VALIDATION.md` →
+        /// `sleep-reference-label-corpus`). See `docs/SLEEP_INTERIOR_AROUSALS.md` §4 for the sweep.
+        public var arousalIntensityCut: Int
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -429,7 +475,8 @@ public enum SleepStaging {
                     preOnsetBedtimeMaxGapEpochs: Int = 5,
                     cadenceWakeQuietEpochs: Int = 20,
                     cadenceWakeMaxQuietEpochs: Int = 240,
-                    stagedWearGate: Bool = true) {
+                    stagedWearGate: Bool = true,
+                    arousalIntensityCut: Int = 200) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -465,6 +512,7 @@ public enum SleepStaging {
             self.cadenceWakeQuietEpochs = cadenceWakeQuietEpochs
             self.cadenceWakeMaxQuietEpochs = cadenceWakeMaxQuietEpochs
             self.stagedWearGate = stagedWearGate
+            self.arousalIntensityCut = arousalIntensityCut
         }
 
         public static let `default` = Tuning()
@@ -677,6 +725,10 @@ public enum SleepStaging {
         // is not a physiological channel — it is the ring's own SpO2 duty cycle, read by
         // `markCadenceWakeOffset` alone (#190).
         var rowLayouts: [BulkRecord.Layout] = []
+        // Parallel to `rows`: the raw `[15:20]` tail byte-sum, ALIGNED to the kept (post-forward-fill)
+        // rows — the interior-arousal pass (`markInteriorArousals`, `Tuning.arousalIntensityCut`)
+        // thresholds this directly rather than the already-collapsed `motionMagnitudes` 0/1/16 scale.
+        var rowTailSums: [Int] = []
         // Per-epoch motion energy is measured ABOVE a LOCAL idle floor (same rolling estimate as
         // detection). Gen 2 idles at ~1, Gen 3 at ~15–16 and DRIFTS across the night with posture
         // (16→24→39, 🟢 FR05.008 capture 2026-06-23). The old `$1 == 1 ? 0 : …` hard-coded Gen 2's
@@ -691,6 +743,11 @@ public enum SleepStaging {
         let floor = ActivityPeriod.rollingLowPercentile(rawMotion, times: times,
                         windowSeconds: ActivityPeriod.motionFloorWindowSecondsStaging,
                         percentile: ActivityPeriod.motionFloorPercentile)
+        // Whether THIS run reads motion off the intensity tail at all — decided once, over the whole
+        // in-bed block, exactly as `motionMagnitudes` above decides it internally. Gates
+        // `markInteriorArousals`: a night with an expressive primary channel never reaches it.
+        let usesTailChannel = BulkSleep.usesMotionIntensityFallback(inBlock)
+        let tailSums = BulkSleep.motionIntensityTailSums(inBlock)
         for (idx, r) in inBlock.enumerated() {
             if let hr = r.heartRate { lastHR = hr }
             if let v = r.hrvRMSSD { lastHRV = v }
@@ -700,6 +757,7 @@ public enum SleepStaging {
             let motion = max(0, Int(rawMotion[idx] - floor[idx]))
             rows.append((r.date(epoch: epoch), hr, lastHRV, motion, lastSpo2, lastRR, r.hrvRMSSD != nil))
             rowLayouts.append(r.layout)
+            rowTailSums.append(tailSums[idx])
         }
         guard rows.count >= 2 else { return [] }
 
@@ -844,6 +902,14 @@ public enum SleepStaging {
         // and is dropped. This is what shrinks an over-wide motion window (e.g.
         // 23:01→09:34 with hours of quiet wakefulness) back to the real night.
         guard let (lo, hi) = sleepSpan(awake, sustain: tuning.onsetSustainEpochs) else { return [] }
+
+        // --- Interior arousals: a lower, tail-only cut for brief mid-night stirs -----
+        // Runs AFTER onset/offset are fixed and marks ONLY lo < i < hi, so it can never move onset
+        // or final wake — `sleepSpan` above is NOT recomputed after this. See `markInteriorArousals`
+        // and `Tuning.arousalIntensityCut` for the full argument.
+        markInteriorArousals(&awake, tailSums: rowTailSums, usesTailChannel: usesTailChannel,
+                             lo: lo, hi: hi, tuning: tuning)
+
         let windowStart = rows[lo].time
         let windowEnd = (hi + 1 < rows.count) ? rows[hi + 1].time : block.end
 
@@ -1506,6 +1572,25 @@ public enum SleepStaging {
         // able to commit a night down to a token fragment.
         guard sleepSpan(candidate, sustain: tuning.minConsolidatedSleepEpochs) != nil else { return }
         awake = candidate
+    }
+
+    /// The interior-arousal pass (`Tuning.arousalIntensityCut`, see its doc comment for why and the
+    /// fitted value). Marks epochs STRICTLY BETWEEN `lo` and `hi` (never `lo` or `hi` themselves) awake
+    /// when their raw `[15:20]` tail sum clears the cut — a lower seam than `motionIntensityActiveCut`
+    /// (345), which 🟢 measured only ever fires at a night's edges, never its interior.
+    ///
+    /// SAFETY: this can ONLY add interior awake. It never touches index `lo` or `hi`, so it cannot
+    /// move onset or final wake — `sleepSpan` is not, and must not be, recomputed after it runs. It is
+    /// also gated on `usesTailChannel`: the primary `[10:15]` channel's magnitudes are a different
+    /// scale (post-floor-subtraction energy, not a raw tail byte-sum), so applying this cut there would
+    /// be a silent unit error, not a fix.
+    static func markInteriorArousals(_ awake: inout [Bool], tailSums: [Int], usesTailChannel: Bool,
+                                     lo: Int, hi: Int, tuning: Tuning) {
+        guard tuning.arousalIntensityCut > 0, usesTailChannel,
+              tailSums.count == awake.count, hi > lo + 1 else { return }
+        for i in (lo + 1) ..< hi where tailSums[i] >= tuning.arousalIntensityCut {
+            awake[i] = true
+        }
     }
 
     /// Centered rolling standard deviation over a ±`half`-epoch window.

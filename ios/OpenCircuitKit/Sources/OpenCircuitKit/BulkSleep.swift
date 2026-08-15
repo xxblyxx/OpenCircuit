@@ -750,10 +750,19 @@ public enum BulkSleep {
     /// labels; see #197.
     static let motionIntensityActiveCut = 345
 
+    /// Raw `[15:20]` tail byte-sum per record — the pre-threshold quantity `motionIntensityFallbackMagnitudes`
+    /// collapses to the 0/1/16 scale below. Exposed separately so `SleepStaging`'s interior-arousal pass
+    /// (`Tuning.arousalIntensityCut`) can apply its OWN, much lower cut directly to the raw sums rather than
+    /// being handed the already-collapsed magnitudes, which cannot express anything between "still" (1) and
+    /// "gross movement" (16, gated at `motionIntensityActiveCut` = 345).
+    static func motionIntensityTailSums(_ records: [BulkRecord]) -> [Int] {
+        records.map { $0.motionIntensityTail.reduce(0) { $0 + Int($1) } }
+    }
+
     static func motionIntensityFallbackMagnitudes(_ records: [BulkRecord],
                                                   degenerate: Bool,
                                                   absoluteActiveCut: Int = motionIntensityActiveCut) -> [Float] {
-        let sums = records.map { $0.motionIntensityTail.reduce(0) { $0 + Int($1) } }
+        let sums = motionIntensityTailSums(records)
         let positive = sums.filter { $0 > 0 }.sorted()
         guard !positive.isEmpty else { return [Float](repeating: 0, count: records.count) }
         // A fixed seam does not care how much history has drained; the legacy ranks did.
