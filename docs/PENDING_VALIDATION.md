@@ -179,6 +179,31 @@ there is no denominator.
 
 ## Settled
 
+### edgeIntensityCut (345) confirmed on a real re-stage — 2026-08-15
+- id: sleep-edge-cut-single-night-fit
+- was: does `markEdgeMotionAwake` recover real pre-sleep/post-wake movement that a block-scoped
+  `motionSource` verdict hides from every other pass, without over-shooting into real sleep, and
+  without moving `.inBed` (only onset/final wake inside it)? Passes-if bands, set before checking:
+  in-bed window unchanged at exactly `08-14 22:15:56 .. 08-15 08:23:26`; OC head awake in `60..80`
+  min (was 0.5m pre-fix); OC interior (WASO) down from 95.0m to `10..45` min (Whoop: 48.5m); OC tail
+  awake not grown past its pre-fix ~29.5m.
+- observed: built, installed (`com.bly.opencircuit`, personal team `KNK78KA6NE`), and force-launched
+  on Jedi Master's iPhone 2026-08-15; the ring reconnected and `restageFromArchive` fired
+  automatically (`ZUPDATEDAT` 808531223 → fresh) without needing a manual Bluetooth toggle.
+  `sleep_reference_labels.py --pull --compare-own` on the re-staged 08-14/15 night:
+  in-bed window **unchanged** (`22:15:56 .. 08:23:26`) — OC head **68.0m** (was 0.5m) — OC interior
+  (WASO) **32.5m** (was 95.0m) — OC tail **29.5m** (unchanged). All four bands hit. Onset moved
+  22:16 → **23:23:56**, 7 min from Whoop's own 23:31 (was 75 min early); final wake stayed
+  **07:53:56** (no significant trailing spike at cut 345 on this night, as `--sweep-edge-cut` had
+  predicted). The user's original complaint — reported awake reading ~2h against Whoop's 49 min —
+  is now explained: ~68 of the ~120 min is real, Whoop-corroborated sleep latency (falling asleep at
+  23:24–23:31, not 22:16), not over-detected wakefulness.
+- still open: this is ONE night. The broader claim ("holds on real nights generally") still rests on
+  a single confirmation, same caveat as `sleep-arousal-cut-single-night-fit` below — re-check as
+  paired label+epoch nights accumulate (`sleep-reference-label-corpus`), and re-sweep
+  `arousalIntensityCut` (currently 200, fitted against the OLD 75-min-early onset) now that onset
+  has moved — its whole fitting window changed.
+
 ### `sleep_awake_trace.py` correctly attributes why a known awakening is dropped — 2026-08-15
 - id: sleep-brief-awakenings-visible
 - was: does the per-epoch trace correctly explain why a specific known awakening does or doesn't

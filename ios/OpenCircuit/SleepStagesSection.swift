@@ -75,9 +75,21 @@ struct SleepStagesSection: View {
     /// identical on the card.
     private var awakenings: SleepAwakenings { SleepAwakenings.from(segments: segments) }
 
+    /// The `.awake` `StageShare` swapped from the pooled `minutes.awake` scalar to WASO alone —
+    /// same denominator as every other stage share (`awake + rem + light + deep`), so all rows
+    /// still sum to ~100%. See `statRows` for why: the pooled scalar is what read as "2 hours
+    /// awake" while Whoop read 49 minutes (docs/SLEEP_AWAKE_RESOLUTION.md).
+    private var wasoShare: SleepStageBreakdown.StageShare {
+        let denom = Double(minutes.awake + minutes.rem + minutes.light + minutes.deep)
+        let waso = awakenings.minutes.waso
+        return .init(stage: .awake, minutes: waso, fraction: denom > 0 ? Double(waso) / denom : 0)
+    }
+
     private var chartAccessibilitySummary: String {
-        shares.map { "\(stageDisplayName($0.stage)) \(SleepStageBreakdown.durationText(minutes: $0.minutes))" }
-            .joined(separator: ", ")
+        shares.map { share in
+            let s = share.stage == .awake ? wasoShare : share
+            return "\(stageDisplayName(s.stage)) \(SleepStageBreakdown.durationText(minutes: s.minutes))"
+        }.joined(separator: ", ")
     }
 
     private var axStagedSegments: [SleepSegment] { stagedSegments(segments) }
@@ -346,11 +358,22 @@ struct SleepStagesSection: View {
             // the stage shares below, there is no sourced population norm for awakening COUNT to
             // cite, and a made-up one would misrepresent this as validated the way it isn't.
             AwakeningsStatRow(awakenings: awakenings)
+            // The "Awake" row uses WASO (`wasoShare`), not the pooled `minutes.awake` scalar that
+            // used to headline this card: pooling pre-sleep latency + WASO + morning lie-in into
+            // one number is what made a quiet 25-minute WASO night read as "2 hours awake"
+            // (docs/SLEEP_AWAKE_RESOLUTION.md). `AwakeningsStatRow`'s own "Xm WASO" above is now
+            // the SAME number, not a footnote to a different one.
             ForEach(shares, id: \.stage) { share in
-                StageStatRow(share: share, name: stageDisplayName(share.stage),
-                            color: stageColor(share.stage),
-                            range: SleepStageBreakdown.referenceRange(for: share.stage))
+                let displayed = share.stage == .awake ? wasoShare : share
+                StageStatRow(share: displayed, name: stageDisplayName(displayed.stage),
+                            color: stageColor(displayed.stage),
+                            range: SleepStageBreakdown.referenceRange(for: displayed.stage))
             }
+            // The two edges WASO deliberately excludes — same "always shown" reasoning as
+            // `AwakeningsStatRow`'s zero-WASO case: a 0min "Falling asleep" is a real, reportable
+            // measurement (fast sleep onset), not an absence of data.
+            EdgeAwakeStatRow(title: "Falling asleep", minutes: awakenings.minutes.headAwake)
+            EdgeAwakeStatRow(title: "Awake in bed (morning)", minutes: awakenings.minutes.tailAwake)
         }
     }
 
@@ -636,6 +659,31 @@ private struct AwakeningsStatRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Awakenings")
         .accessibilityValue("\(awakenings.count), \(wasoText) wake after sleep onset")
+    }
+}
+
+// MARK: - Edge awake row
+
+/// Sleep latency ("Falling asleep") and the morning lie-in ("Awake in bed (morning)") — the two
+/// edges of the night the pooled `.awake` scalar used to hide inside a single number
+/// (docs/SLEEP_AWAKE_RESOLUTION.md, docs/SLEEP_AWAKENING_METRICS.md §1). Same simplified shape as
+/// `AwakeningsStatRow` above: neither quantity has a sourced population reference range, so this
+/// skips the proportional track and tick marks `StageStatRow` draws.
+private struct EdgeAwakeStatRow: View {
+    let title: String
+    let minutes: Int
+
+    private var text: String { SleepStageBreakdown.durationText(minutes: minutes) }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(title).font(.subheadline.weight(.semibold))
+            Spacer()
+            Text(text).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(text)
     }
 }
 

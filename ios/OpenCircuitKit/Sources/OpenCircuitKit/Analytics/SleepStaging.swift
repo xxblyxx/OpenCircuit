@@ -441,6 +441,58 @@ public enum SleepStaging {
         /// `sleep-reference-label-corpus`). See `docs/SLEEP_INTERIOR_AROUSALS.md` §4 for the sweep.
         public var arousalIntensityCut: Int
 
+        /// Tail-sum cut (same raw `[15:20]` units as `arousalIntensityCut` / `motionIntensityActiveCut`)
+        /// above which an epoch in the LEADING or TRAILING `onsetSearchEpochs` region — i.e. before
+        /// onset or after final wake are anchored — counts as edge-of-night motion-awake.
+        ///
+        /// Fixes the mirror-image bug to `arousalIntensityCut`'s: `BulkSleep.motionSource` decides
+        /// primary-vs-intensity-tail ONCE over the whole in-bed block, so a handful of expressive
+        /// getting-in/out-of-bed epochs can flip a night whose SLEEP INTERIOR is 100% placeholder
+        /// motion to `.primary`, and the primary channel then reads that pre-sleep/post-wake movement
+        /// as flat zero. Without this pass the awake mask falls back to HR alone at the edges, and a
+        /// calm pre-sleep HR (well under `wakeHRMarginBPM` above floor, and under `onsetMinDescentBPM`
+        /// of descent for `markDescentOnsetAwake` to fire on) never flags it — onset anchors on the
+        /// FIRST in-bed epoch instead of when the wearer actually stopped moving.
+        ///
+        /// 🟢 MEASURED 2026-08-14/15 (the night this was built against, `docs/SLEEP_AWAKE_RESOLUTION.md`
+        /// and `docs/SLEEP_INTERIOR_AROUSALS.md` §4): primary motion was the `[10:15]` placeholder for
+        /// 241/248 night epochs, but the block-scoped verdict still read `.primary`. Onset anchored at
+        /// 22:16, Whoop's own labelled onset was 23:31 — 74.8 min later — and the ~70 min of real
+        /// getting-into-bed movement between them then fell INSIDE the sleep window, where
+        /// `arousalIntensityCut` (correctly) flagged it as interior arousals. Reported awake for that
+        /// night was 120 min against Whoop's 48.5 min; nearly all of the gap was this.
+        ///
+        /// Defaults to `motionIntensityActiveCut` (345), NOT `arousalIntensityCut`'s more sensitive 200
+        /// — deliberately. A false positive here MOVES ONSET OR FINAL WAKE, the highest-risk operation
+        /// in this file; a false positive in the interior only adds one WASO minute. The edge signal on
+        /// the measured night was strong regardless (tail sums 292–656 against the quiet-onward run of
+        /// 0), so the extra sensitivity of 200 buys nothing: at 345 the last pre-quiet hit is 23:21, at
+        /// 200 it is 23:23 — both one epoch of Whoop's 23:31. This is the region-scoped application of
+        /// a decision the code already makes elsewhere, not a new numeric threshold.
+        ///
+        /// **`0` DISABLES the pass entirely — byte-identical to pre-this-feature staging.**
+        ///
+        /// 🟢 MEASURED sweep (`desktop/sleep_reference_labels.py --sweep-edge-cut`), against Whoop's
+        /// own labelled onset/wake for the 08-14/15 night — reports the SIGNED error a candidate cut
+        /// would produce (no `sleepSpan`/erosion re-run; see the sweep's own header comment for the
+        /// approximation), our stored (pre-fix) onset/wake for reference (22:16 / 07:54):
+        ///     cut   onset (err)      wake (err)
+        ///     345   23:24 (−7.3m)    07:56 (+14.9m)   ← chosen
+        ///     300   23:24 (−7.3m)    07:44 (+2.4m)
+        ///     250   23:26 (−4.8m)    07:04 (−37.6m)   ← wake cliff: a false trailing hit fires here
+        ///     200   23:26 (−4.8m)    07:04 (−37.6m)
+        ///     150   23:29 (−2.3m)    07:04 (−37.6m)
+        /// Onset error shrinks monotonically as the cut drops, but wake error falls off a cliff at
+        /// 250 — a spurious trailing-region hit yanks final wake 37 min too early. 345 is the highest
+        /// cut with a real leading signal (clears `motionIntensityActiveCut`'s own seam) and is on the
+        /// SAFE side of that cliff; a lower cut buys ~5 min of onset accuracy at the cost of the wake
+        /// side breaking outright. This is the concrete case the doc comment above predicted before
+        /// this data existed: false positives at the edges are asymmetric in cost, so the pass
+        /// deliberately does not chase the interior pass's more sensitive 200.
+        ///
+        /// 🟡 FITTED ON ONE NIGHT. See `docs/PENDING_VALIDATION.md` → `sleep-edge-cut-single-night-fit`.
+        public var edgeIntensityCut: Int
+
         public init(awakeMotion: Int = 15,
                     deepHRPercentile: Double = 0.42,
                     remHRPercentile: Double = 0.86,
@@ -476,7 +528,8 @@ public enum SleepStaging {
                     cadenceWakeQuietEpochs: Int = 20,
                     cadenceWakeMaxQuietEpochs: Int = 240,
                     stagedWearGate: Bool = true,
-                    arousalIntensityCut: Int = 200) {
+                    arousalIntensityCut: Int = 200,
+                    edgeIntensityCut: Int = 345) {
             self.awakeMotion = awakeMotion
             self.deepHRPercentile = deepHRPercentile
             self.remHRPercentile = remHRPercentile
@@ -513,6 +566,7 @@ public enum SleepStaging {
             self.cadenceWakeMaxQuietEpochs = cadenceWakeMaxQuietEpochs
             self.stagedWearGate = stagedWearGate
             self.arousalIntensityCut = arousalIntensityCut
+            self.edgeIntensityCut = edgeIntensityCut
         }
 
         public static let `default` = Tuning()
@@ -859,6 +913,15 @@ public enum SleepStaging {
         rescueSecondBoutHRWake(&awake, smHR: smHR, motionAwake: motionAwake,
                                vitals: rows.map(\.vitals), floor: sleepFloor, tuning: tuning)
         let lastRescuedIndex = awake.indices.last { beforeSecondBoutRescue[$0] && !awake[$0] }
+
+        // --- Edge motion-awake: the pre-sleep/post-wake mirror of markInteriorArousals -----
+        // Runs AFTER erosion (our marks aren't motion-backed in `motionAwake[]`, so running before
+        // would expose them to `erodeShortHRWake`'s deletion) and BEFORE both onset passes below, so
+        // `markLeadInWakeOnset` composes correctly over whatever this adds — filling the quiet dips
+        // inside a real pre-sleep block is exactly its job and needs no change here. Unlike
+        // `markInteriorArousals`, this pass MUST be able to move onset/final wake: it runs before
+        // `sleepSpan` fixes them, not after.
+        markEdgeMotionAwake(&awake, tailSums: rowTailSums, records: rowRecords, tuning: tuning)
 
         // --- Descent-relative onset: trim the quiet pre-sleep wind-down -------------
         // Mark the LEADING in-bed stretch as awake while HR is still settling DOWN toward the
@@ -1619,6 +1682,43 @@ public enum SleepStaging {
         guard BulkSleep.usesMotionIntensityFallback(interior) else { return }
         for i in (lo + 1) ..< hi where tailSums[i] >= tuning.arousalIntensityCut {
             awake[i] = true
+        }
+    }
+
+    /// The edge-motion pass (`Tuning.edgeIntensityCut`, see its doc comment for why and the default).
+    /// Marks epochs in the LEADING or TRAILING `onsetSearchEpochs` region awake when their raw
+    /// `[15:20]` tail sum clears the cut — the mirror-image fix to `markInteriorArousals` above,
+    /// applied where a block-scoped motion-channel verdict hides real pre-sleep/post-wake movement
+    /// instead of hiding real interior movement.
+    ///
+    /// SAFETY: each region's motion-channel verdict is decided on THAT REGION'S OWN SLICE, not the
+    /// whole in-bed block — the same self-consistency argument as `markInteriorArousals`: the window
+    /// tested is exactly the window written to, and `motionSource`/`motionMagnitudes` (which drive
+    /// every other pass in this function) still see the whole block, byte-identically.
+    ///
+    /// Unlike `markInteriorArousals`, this pass runs BEFORE `sleepSpan` and is meant to move onset and
+    /// final wake — that is its entire purpose. But it can also shrink the asleep span to nothing if
+    /// left unchecked, so each region carries the same survival guard `markPointOfNoReturnOffset` and
+    /// `markCadenceWakeOffset` use: commit only if a CONSOLIDATED asleep run of
+    /// `minConsolidatedSleepEpochs` still exists afterward. The two regions are applied independently,
+    /// each against the current `awake` (so a change committed by one is visible to the other) —
+    /// on a short night the regions can overlap, which is harmless since both write the same rule.
+    ///
+    /// `0` DISABLES the pass entirely — byte-identical to pre-this-feature staging.
+    static func markEdgeMotionAwake(_ awake: inout [Bool], tailSums: [Int], records: [BulkRecord],
+                                    tuning: Tuning) {
+        guard tuning.edgeIntensityCut > 0, tailSums.count == awake.count,
+              records.count == awake.count, !awake.isEmpty else { return }
+        let n = awake.count
+        let reach = min(tuning.onsetSearchEpochs, n)
+        let regions = [0 ..< reach, (n - reach) ..< n]
+        for region in regions where !region.isEmpty {
+            let slice = Array(records[region])
+            guard BulkSleep.usesMotionIntensityFallback(slice) else { continue }
+            var candidate = awake
+            for i in region where tailSums[i] >= tuning.edgeIntensityCut { candidate[i] = true }
+            guard sleepSpan(candidate, sustain: tuning.minConsolidatedSleepEpochs) != nil else { continue }
+            awake = candidate
         }
     }
 

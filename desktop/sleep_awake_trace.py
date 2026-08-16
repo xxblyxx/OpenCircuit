@@ -434,6 +434,12 @@ def run_trace(records, at_times=None, window_minutes=20, tz=None, night=None):
     print(f"  final-awake total: {total_final} epochs ({total_final * 150 / 60:.0f} min)")
     print(f"  erased by erode/rescue (not by the onset/offset edge passes): "
           f"{total_rescued_away} epochs ({total_rescued_away * 150 / 60:.0f} min)")
+    print("  NOT reflected above: markInteriorArousals / markEdgeMotionAwake. Both decide their own")
+    print("  REGION-scoped motion-source verdict (interior-only / each edge separately); the")
+    print("  'motion source' verdict this trace prints above is for the WHOLE block, like every")
+    print("  other pass correctly still uses. For the authoritative post-fix numbers, use")
+    print("  sleep_reference_labels.py --compare-own (reads the real staged hypnogram off the")
+    print("  device) or --sweep-edge-cut / --sweep-arousal-cut (work off raw records directly).")
 
 
 def _parse_at(s):

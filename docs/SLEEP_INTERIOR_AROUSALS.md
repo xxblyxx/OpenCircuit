@@ -223,6 +223,19 @@ night. 200 gives the same practical result with more margin from that step.
 Recorded in the `Tuning.arousalIntensityCut` doc comment (`SleepStaging.swift`), which is the
 source of truth for this table going forward — update both together if this is ever re-fit.
 
+> **⚠️ The 74.8-min confound above was routed around for the FIT, never for PRODUCTION — until
+> `fix/sleep-onset-edge-motion` (2026-08-15).** The paragraph above says outright that using our own
+> (broken) onset "affects only which cut was picked, never what ships (production always uses our
+> own onset/finalWake, exactly as designed)" — true as written, but it meant production kept
+> shipping the 74.8-min-early onset unfixed. The first real re-stage with this pass live confirmed
+> the consequence: OC awake for 08-14/15 went 30 m → 120 m, with the new 95 m of "interior arousals"
+> almost entirely being that same pre-sleep movement, now correctly detected but sitting inside a
+> sleep window that opened too early (`docs/SLEEP_AWAKE_RESOLUTION.md` §4.1's superseded-note).
+> `markEdgeMotionAwake` (`SleepStaging.swift`, same mechanism as this file's §1b fix, mirrored to the
+> two edges) closes that gap. **Re-sweep `arousalIntensityCut` once the edge fix is confirmed
+> on-device** — the 200 above was chosen against a night whose onset is about to change by ~70
+> minutes, and every count in the table is downstream of that window.
+
 ## 5. Acceptance criteria
 
 1. **DONE** — `swift test`: 1457 tests (8 new, including the §1b regression test), same one known

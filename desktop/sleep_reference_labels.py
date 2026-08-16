@@ -68,6 +68,11 @@ APPLE_EPOCH = 978_307_200   # Codable/Core Data Date -> unix (matches device_ale
 # is no shared source of truth between Swift and this file for this one constant.
 MERGE_TOLERANCE_SECONDS = 150
 
+# Mirrors SleepStaging.Tuning.onsetSearchEpochs (default 48 == 2h @ 150s/epoch) -- the bound both
+# markEdgeMotionAwake's leading/trailing regions and the two Swift offset passes search within.
+# Same "no shared source of truth" caveat as MERGE_TOLERANCE_SECONDS above.
+EDGE_SEARCH_SECONDS = 48 * 150
+
 # ExternalSleepCodec's stage codes (pinned by ExternalSleepSampleTests.testStageCodesMatchHypnogramCodec)
 STAGE_FOR_CODE = {0: "inBed", 1: "awake", 2: "light", 3: "deep", 4: "rem"}
 # The RingConn `sleepPhases` vocabulary ringconn_sleep_fit.py's --groundtruth expects.
@@ -293,14 +298,16 @@ def load_own_nights(store_path):
 def compute_awakenings(segments):
     """Port of `SleepAwakenings.from` (SLEEP_AWAKENING_METRICS.md §5.1): given a night's staged
     (start_unix, end_unix, stage) triples INCLUDING inBed, return
-    {count, waso, longest, edge_awake} in seconds. Mirrors the Swift algorithm step for step --
-    filter inBed, find onset/finalWake from asleep segments, clip awake to that window, merge runs
-    touching within `MERGE_TOLERANCE_SECONDS`."""
+    {count, waso, longest, edge_awake, head_awake, tail_awake} in seconds. Mirrors the Swift
+    algorithm step for step -- filter inBed, find onset/finalWake from asleep segments, clip awake
+    to that window, merge runs touching within `MERGE_TOLERANCE_SECONDS`. `head_awake`/`tail_awake`
+    split `edge_awake` into pre-onset (sleep latency) and post-final-wake (morning lie-in) --
+    ported alongside `SleepStaging.markEdgeMotionAwake`, docs/SLEEP_AWAKE_RESOLUTION.md."""
     staged = [(s, e, st) for s, e, st in segments if st != "inBed"]
     asleep_stages = {"light", "deep", "rem"}
     asleep = [(s, e) for s, e, st in staged if st in asleep_stages]
     if not asleep:
-        return {"count": 0, "waso": 0, "longest": 0, "edge_awake": 0}
+        return {"count": 0, "waso": 0, "longest": 0, "edge_awake": 0, "head_awake": 0, "tail_awake": 0}
     onset = min(s for s, e in asleep)
     final_wake = max(e for s, e in asleep)
 
@@ -323,8 +330,10 @@ def compute_awakenings(segments):
 
     waso = sum(e - s for s, e in merged)
     longest = max((e - s for s, e in merged), default=0)
+    head_awake = sum(max(0, min(e, onset) - s) for s, e in awake if s < onset)
+    tail_awake = sum(max(0, e - max(s, final_wake)) for s, e in awake if e > final_wake)
     return {"count": len(merged), "waso": waso, "longest": longest,
-            "edge_awake": total_awake - waso}
+            "edge_awake": total_awake - waso, "head_awake": head_awake, "tail_awake": tail_awake}
 
 
 def compare_own(labels, store_path, tz):
@@ -340,7 +349,8 @@ def compare_own(labels, store_path, tz):
 
     sources = sorted({src for src, s, e, st in labels})
     print(f"\n--- our own interior/edge awake split, per stored night (SLEEP_AWAKE_RESOLUTION §4.1) ---")
-    header = f"{'night (in-bed window)':<32}{'OC awake':>10}{'OC interior':>13}{'OC edge':>9}"
+    header = (f"{'night (in-bed window)':<32}{'OC awake':>10}{'OC interior':>13}"
+             f"{'OC head':>9}{'OC tail':>9}")
     for src in sources:
         header += f"{src + ' awake':>16}"
     print(header)
@@ -350,9 +360,10 @@ def compare_own(labels, store_path, tz):
         result = compute_awakenings(segments)
         oc_total_min = (result["waso"] + result["edge_awake"]) / 60
         oc_interior_min = result["waso"] / 60
-        oc_edge_min = result["edge_awake"] / 60
+        oc_head_min = result["head_awake"] / 60
+        oc_tail_min = result["tail_awake"] / 60
         row = (f"{fmt(in_bed_start, tz) + ' .. ' + fmt(in_bed_end, tz):<32}"
-               f"{oc_total_min:>9.1f}m{oc_interior_min:>12.1f}m{oc_edge_min:>8.1f}m")
+               f"{oc_total_min:>9.1f}m{oc_interior_min:>12.1f}m{oc_head_min:>8.1f}m{oc_tail_min:>8.1f}m")
         for src in sources:
             overlap_min = sum(max(0, min(e, in_bed_end) - max(s, in_bed_start))
                               for s2, s, e, st in labels
@@ -448,6 +459,86 @@ def sweep_arousal_cut(labels, store_path, archives, tz, cuts):
             print(f"    {cut:>6}{len(merged):>8}{waso:>10.1f}m")
 
 
+# --------------------------------------------------------------------------- --sweep-edge-cut
+#
+# Fits `SleepStaging.Tuning.edgeIntensityCut` -- the mirror-image sweep to `sweep_arousal_cut`
+# above. Unlike the interior pass, `markEdgeMotionAwake` CAN move onset/finalWake (that's its
+# whole job), so this can't reuse the "fixed window, count hits inside it" trick. Instead it
+# reports the SIGNED ONSET/FINAL-WAKE ERROR each candidate cut would produce, against a reference
+# source's own labelled onset/wake -- the boundary-error instrument neither `sweep_arousal_cut`
+# (an informational delta line only) nor `ringconn_sleep_fit.py`'s per-epoch accuracy/macro-F1
+# objective provides (a 20-min boundary shift barely registers there).
+#
+# ⚠️ SIMPLIFIED, same spirit as `sweep_arousal_cut`'s own fixed-window approximation: this does
+# NOT re-run `motionSource`/`usesMotionIntensityFallback` (no Python port exists -- the CSV feature
+# format `ringconn_sleep_fit.py` reads has no `[15:20]` tail column to port it against, the same gap
+# that has kept `markInteriorArousals` unported) or replicate `onsetSustainEpochs`'s run-length
+# gating. It answers "where would the LAST qualifying leading spike / FIRST qualifying trailing
+# spike put the edge", which is what the cut choice actually turns on.
+
+def sweep_edge_cut(labels, store_path, archives, tz, cuts):
+    bounds = load_own_night_bounds(store_path)
+    if not bounds:
+        print("\nno stored nights to sweep")
+        return
+    sources = sorted({src for src, s, e, st in labels})
+    all_recs = sorted((r for recs in archives.values() for r in recs), key=lambda r: r.time)
+    print(f"\n--- edge-cut sweep (markEdgeMotionAwake) ---")
+    print("approximates markEdgeMotionAwake: for each cut, onset = 150s after the LAST leading-region "
+          "epoch clearing it; final wake = the FIRST trailing-region epoch clearing it. No "
+          "motionSource/sustain-run gating -- see the header comment above for why.")
+    for in_bed_start, in_bed_end, our_onset, our_final_wake in bounds:
+        print(f"\nnight {fmt(in_bed_start, tz)} .. {fmt(in_bed_end, tz)}")
+        window_recs = [r for r in all_recs if in_bed_start <= r.time <= in_bed_end]
+        if not window_recs:
+            print("  no raw epochs in the pulled archive for this night (outside ~30h retention)")
+            continue
+        # Reference onset/wake for THIS night: prefer a source's own labelled asleep span (same
+        # preference order as sweep_arousal_cut), falling back to nothing printable when no source
+        # covers the night -- the sweep still runs, it just can't report an error against a source.
+        ref_onset = ref_wake = ref_source = None
+        for src in sources:
+            src_asleep = [(s, e) for s2, s, e, st in labels
+                         if s2 == src and st in ("light", "deep", "rem")
+                         and s < in_bed_end and e > in_bed_start]
+            if src_asleep:
+                ref_onset, ref_wake = min(s for s, e in src_asleep), max(e for s, e in src_asleep)
+                ref_source = src
+                break
+        if ref_source:
+            print(f"  reference: {ref_source}'s own labelled onset/wake "
+                  f"({fmt(ref_onset, tz)} .. {fmt(ref_wake, tz)})")
+        else:
+            print("  no reference source covers this night -- errors will not be printed")
+        if our_onset is not None:
+            print(f"  our own stored onset/wake: {fmt(our_onset, tz)} .. {fmt(our_final_wake, tz)}")
+
+        reach = min(EDGE_SEARCH_SECONDS, (in_bed_end - in_bed_start) / 2)
+        leading = [r for r in window_recs if r.time < in_bed_start + reach]
+        trailing = [r for r in window_recs if r.time >= in_bed_end - reach]
+
+        header = f"    {'cut':>6}{'onset':>12}"
+        if ref_source:
+            header += f"{'err(min)':>10}"
+        header += f"{'wake':>12}"
+        if ref_source:
+            header += f"{'err(min)':>10}"
+        print(header)
+        for cut in cuts:
+            lead_hits = [r.time for r in leading if sum(r.intensity_tail) >= cut]
+            candidate_onset = (max(lead_hits) + 150) if lead_hits else in_bed_start
+            trail_hits = [r.time for r in trailing if sum(r.intensity_tail) >= cut]
+            candidate_wake = min(trail_hits) if trail_hits else in_bed_end
+
+            row = f"    {cut:>6}{fmt(candidate_onset, tz):>12}"
+            if ref_source:
+                row += f"{(candidate_onset - ref_onset) / 60:>+9.1f}m"
+            row += f"{fmt(candidate_wake, tz):>12}"
+            if ref_source:
+                row += f"{(candidate_wake - ref_wake) / 60:>+9.1f}m"
+            print(row)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -469,6 +560,11 @@ def main():
                          "simulate markInteriorArousals at each comma-separated cut and print "
                          "the resulting awakening count per stored night. Bare flag (no value) "
                          "uses the default sweep: 345,300,250,200,150,120,100,75,50")
+    ap.add_argument("--sweep-edge-cut", nargs="?", const="", metavar="C1,C2,...",
+                    help="fit Tuning.edgeIntensityCut: report the signed onset/final-wake error "
+                         "(minutes) each cut would produce, against a reference source's own "
+                         "labelled onset/wake. Bare flag uses the default sweep: "
+                         "345,300,250,200,150,100,50")
     ap.add_argument("--source", help="restrict to one source name (e.g. WHOOP)")
     args = ap.parse_args()
 
@@ -499,6 +595,11 @@ def main():
         cuts = ([int(c.strip()) for c in args.sweep_arousal_cut.split(",")] if args.sweep_arousal_cut
                 else [345, 300, 250, 200, 150, 120, 100, 75, 50])
         sweep_arousal_cut(labels, args.dir / STORE_NAME, load_archives(prefs), tz, cuts)
+
+    if args.sweep_edge_cut is not None:
+        cuts = ([int(c.strip()) for c in args.sweep_edge_cut.split(",")] if args.sweep_edge_cut
+                else [345, 300, 250, 200, 150, 100, 50])
+        sweep_edge_cut(labels, args.dir / STORE_NAME, load_archives(prefs), tz, cuts)
 
     if not labels:
         return

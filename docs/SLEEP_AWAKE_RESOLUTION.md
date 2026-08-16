@@ -70,6 +70,19 @@ roughly 2×, and the missing minutes are counted as sleep, which is what inflate
 implausible 0.94–0.97 range. (08-14 at 0.97 exceeds `SleepConfidence.implausibleEfficiency` = 0.95,
 so the flag built for exactly this symptom is already firing.)
 
+> **⚠️ SUPERSEDED for the 08-14/15 row, 2026-08-15 (`fix/sleep-onset-edge-motion`).** Shipping
+> `markInteriorArousals` (§1b, same day) made the "zero interior, ever" finding above stop holding
+> for that night — but not the way anyone wanted: OC awake jumped **30 m → 120 m**, with **95 m now
+> reported as INTERIOR** (WASO), because the block-scoped `motionSource` verdict that hid the
+> pre-sleep `[15:20]` movement from every other pass *also* anchored our onset **74.8 min early**
+> (22:16 vs Whoop's 23:31, `docs/SLEEP_INTERIOR_AROUSALS.md` §4) — so the newly-live arousal pass
+> correctly detected the wearer getting into bed, and correctly-but-wrongly filed it as mid-night
+> WASO because it was sitting inside a sleep window that started too soon. Same root mechanism as
+> §1b, mirror-image scope: `markEdgeMotionAwake` (`SleepStaging.swift`) fixes it by letting the
+> LEADING/TRAILING regions decide their own motion-channel verdict, exactly as §1b's fix does for
+> the interior. See its `docs/PENDING_VALIDATION.md` entry (`sleep-edge-cut-single-night-fit`) for
+> the not-yet-on-device-confirmed numbers this is expected to produce.
+
 ### 4.2 Every real awakening is below our erosion floor
 
 The 19 Whoop intervals on the traced night, in minutes:

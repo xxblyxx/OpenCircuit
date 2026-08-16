@@ -18,31 +18,42 @@ public struct SleepAwakenings: Equatable, Sendable {
     public let waso: TimeInterval
     /// Duration of the longest single interior awakening. `0` when `count == 0`.
     public let longest: TimeInterval
-    /// Awake time OUTSIDE [onset, finalWake] — pre-sleep wind-down + post-wake lie-in.
+    /// Awake time OUTSIDE [onset, finalWake] — pre-sleep wind-down + post-wake lie-in. Kept as the
+    /// sum `headAwake + tailAwake` for callers that only want the pooled edge figure.
     public let edgeAwake: TimeInterval
+    /// Awake time BEFORE onset — sleep latency, i.e. "how long did it take to fall asleep". Diagnosed
+    /// 2026-08-15 (`docs/SLEEP_AWAKE_RESOLUTION.md`, the 08-14/15 night): before `markEdgeMotionAwake`,
+    /// a block-scoped motion-channel blind spot could anchor onset ~75 min early, so real pre-sleep
+    /// movement showed up as WASO instead of here.
+    public let headAwake: TimeInterval
+    /// Awake time AFTER final wake — the morning lie-in.
+    public let tailAwake: TimeInterval
     /// The merged interior awake runs, in chronological order. Kept (not just the count) so a
     /// future UI can mark them on the hypnogram, and so tests can assert on more than a count.
     public let intervals: [DateInterval]
 
-    public init(count: Int, waso: TimeInterval, longest: TimeInterval,
-               edgeAwake: TimeInterval, intervals: [DateInterval]) {
+    public init(count: Int, waso: TimeInterval, longest: TimeInterval, edgeAwake: TimeInterval,
+               headAwake: TimeInterval = 0, tailAwake: TimeInterval = 0, intervals: [DateInterval]) {
         self.count = count
         self.waso = waso
         self.longest = longest
         self.edgeAwake = edgeAwake
+        self.headAwake = headAwake
+        self.tailAwake = tailAwake
         self.intervals = intervals
     }
 
     /// Rounded-minute convenience for display, mirroring `SleepStaging.Summary.minutes`.
-    public var minutes: (waso: Int, longest: Int, edgeAwake: Int) {
+    public var minutes: (waso: Int, longest: Int, edgeAwake: Int, headAwake: Int, tailAwake: Int) {
         func m(_ t: TimeInterval) -> Int { Int((t / 60).rounded()) }
-        return (m(waso), m(longest), m(edgeAwake))
+        return (m(waso), m(longest), m(edgeAwake), m(headAwake), m(tailAwake))
     }
 
     /// The zero value: a night with no interior awakenings and no edge awake. Distinct from "no
     /// asleep segments at all", which is ALSO this value (§3's "nil/empty behaviour" — no onset
     /// means no interior to speak of, never a phantom whole-night awakening).
-    public static let zero = SleepAwakenings(count: 0, waso: 0, longest: 0, edgeAwake: 0, intervals: [])
+    public static let zero = SleepAwakenings(count: 0, waso: 0, longest: 0, edgeAwake: 0,
+                                             headAwake: 0, tailAwake: 0, intervals: [])
 }
 
 public extension SleepAwakenings {
@@ -91,7 +102,22 @@ public extension SleepAwakenings {
         let longest = merged.map(\.duration).max() ?? 0
         let edgeAwake = totalAwake - waso
 
-        return SleepAwakenings(count: merged.count, waso: waso, longest: longest,
-                               edgeAwake: edgeAwake, intervals: merged)
+        // Split edgeAwake into head (pre-onset) and tail (post-final-wake), the same clip-and-sum
+        // shape as `interiorRaw` above but for the two OUTSIDE slices instead of the inside one. A
+        // segment straddling onset or finalWake contributes only its outside portion here — the
+        // inside portion is already counted in `waso` via `interiorRaw`'s clip, so head/tail/waso
+        // never double-count a straddling segment (SLEEP_AWAKENING_METRICS.md §4.4's clip argument,
+        // applied symmetrically).
+        let headAwake = awakeSegments.reduce(0) { total, seg -> TimeInterval in
+            guard seg.start < onset else { return total }
+            return total + min(seg.end, onset).timeIntervalSince(seg.start)
+        }
+        let tailAwake = awakeSegments.reduce(0) { total, seg -> TimeInterval in
+            guard seg.end > finalWake else { return total }
+            return total + seg.end.timeIntervalSince(max(seg.start, finalWake))
+        }
+
+        return SleepAwakenings(count: merged.count, waso: waso, longest: longest, edgeAwake: edgeAwake,
+                               headAwake: headAwake, tailAwake: tailAwake, intervals: merged)
     }
 }
