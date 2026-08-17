@@ -104,11 +104,20 @@ Opus advisor is Sonnet's escalation path back to Opus without leaving execution 
 - **Opus (main thread)** — read the problem, design, write plans, review diffs, and make
   the calls that need taste: protocol confidence tags, sleep-staging tuning, whether a
   `PENDING_VALIDATION` entry actually passed.
-- **Delegate by default, don't ask first** — repo search (`Explore`/`locate`), builds and
-  tests and capture/audit script runs (`implementer`/`chore-runner`), and all reading
-  under `refs/` (`refs-reader`).
-- **Never on Opus** — bulk grep, `xcodebuild`, `pytest`, `--pull` runs, AGPL/PolyForm
-  source reading. These belong on the agents above, not the main thread.
+- **Delegation is opt-in on this harness, not automatic** — the `Agent` tool's own policy
+  ("don't spawn agents unless the user asks") blocks silent auto-routing even when the
+  work matches an agent below. Get there by *naming* the agent in the request ("use
+  `locate`: …", "have `Explore` trace …") or by a rule here explicitly telling Claude to
+  name it for a given class of work. Confirmed 2026-08-17 (`d9dd79eb` → `dc3460bc`), same
+  question asked both ways in one session: unnamed ("which files under `desktop/` end in
+  `.py`") landed on the main thread; named ("use the `locate` agent: …") correctly spawned
+  `locate` on Haiku and returned the right list.
+- **The routing map, once delegation is invoked**: repo search → `Explore`/`locate`,
+  builds/tests/capture/audit runs → `implementer`/`chore-runner`, all reading under
+  `refs/` → `refs-reader`.
+- **Ask for the agent when the work is this shape** — bulk grep, `xcodebuild`, `pytest`,
+  `--pull` runs, AGPL/PolyForm source reading. These belong on the agents above; naming
+  one is what gets them there, since the main thread won't self-route to them.
 - **`locate` vs `Explore`**: `locate` only when the complete answer is a file list
   producible by glob/grep alone. The moment answering needs reading a file to understand
   what the code *does*, it's `Explore`. When in doubt, `Explore`.
@@ -117,6 +126,10 @@ Opus advisor is Sonnet's escalation path back to Opus without leaving execution 
   claim or a plan premise.
 - **Belt-and-braces** — pass `model` explicitly on Agent invocations too, in case an
   agent-name override (e.g. `Explore` shadowing the built-in) is ever rejected.
+- **Load-time gotcha** — `.claude/agents/*.md` and `settings.json` are read once at
+  process start. `--resume`/`--continue` keeps the *original* registry; the
+  `SessionStart` hook firing on `resume` (so the usage banner appears) is not proof of a
+  fresh start. Changes to either need a genuinely new session to take effect.
 
 ## Map
 | Path | What |
