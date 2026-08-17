@@ -97,9 +97,31 @@ a branch and recommend a branch name. Do not start editing until that's settled.
 - (Reminder: `origin` is `xxblyxx/OpenCircuit`. Branches never go to `upstream` —
   see the no-upstream-contributions rule at the top.)
 
+## Model tiering
+Opus (main thread) decides; delegated subagents in `.claude/agents/` do the work; the
+Opus advisor is Sonnet's escalation path back to Opus without leaving execution mode.
+
+- **Opus (main thread)** — read the problem, design, write plans, review diffs, and make
+  the calls that need taste: protocol confidence tags, sleep-staging tuning, whether a
+  `PENDING_VALIDATION` entry actually passed.
+- **Delegate by default, don't ask first** — repo search (`Explore`/`locate`), builds and
+  tests and capture/audit script runs (`implementer`/`chore-runner`), and all reading
+  under `refs/` (`refs-reader`).
+- **Never on Opus** — bulk grep, `xcodebuild`, `pytest`, `--pull` runs, AGPL/PolyForm
+  source reading. These belong on the agents above, not the main thread.
+- **`locate` vs `Explore`**: `locate` only when the complete answer is a file list
+  producible by glob/grep alone. The moment answering needs reading a file to understand
+  what the code *does*, it's `Explore`. When in doubt, `Explore`.
+- **Accuracy rule** — a delegated result is evidence, not truth. Cross-check a surprising
+  `Explore` or `refs-reader` finding against the file before it becomes a 🟢 protocol
+  claim or a plan premise.
+- **Belt-and-braces** — pass `model` explicitly on Agent invocations too, in case an
+  agent-name override (e.g. `Explore` shadowing the built-in) is ever rejected.
+
 ## Map
 | Path | What |
 |---|---|
+| `.claude/agents/` | **Model-tiered subagents** — `Explore`/`locate` (search), `implementer` (write code), `refs-reader` (mine `refs/`), `chore-runner` (run+report). See "Model tiering" above |
 | `desktop/opencircuit/` | RE workbench: scan/enumerate/listen/replay/decode-log/guess-checksum |
 | `docs/PROTOCOL.md` | Living protocol spec (the Phase 1 deliverable) |
 | `docs/REVERSE_ENGINEERING.md` | Capture + decode workflow |

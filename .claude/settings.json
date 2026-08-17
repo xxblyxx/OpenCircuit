@@ -1,4 +1,6 @@
 {
+  "model": "opusplan",
+  "advisorModel": "opus",
   "hooks": {
     "SessionStart": [
       {
