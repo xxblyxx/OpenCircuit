@@ -1,11 +1,16 @@
 // Gate for mirroring a night's sleep to Apple Health.
 //
 // WHY. With periodic overnight draining (HistoryDrainCadence) the staged night GROWS as epochs
-// arrive, and the HealthKit sleep watermark (`LocalStore.pendingHealthSleep`) keys off the latest
-// segment end — so writing a still-in-progress night on each drain would lay down OVERLAPPING sleep
-// samples in Apple Health. Defer the write until the night is "settled": its latest segment ended
-// far enough in the past that it won't advance again (the sleeper is up). The watermark then blocks
-// any re-write of that same settled night, so it lands exactly once.
+// arrive — so writing a still-in-progress night on each drain would lay down samples for a night
+// that hasn't finished being staged. Defer the write until the night is "settled": its latest
+// segment ended far enough in the past that it won't advance again (the sleeper is up).
+//
+// NOTE: what happens once a night IS settled is `HealthKitWriter.mirrorSettledNight`, not a forward
+// watermark — it delete-and-replaces the night whenever its staging signature changes, so a later,
+// fuller re-stage reaches Health too. (`LocalStore.pendingHealthSleep`/`markSleepWritten` are the
+// OLD forward-only watermark this superseded; they are dead code, kept only so an existing store
+// doesn't need a destructive migration.) This file's gate is only "is it time to look at this night
+// at all", not "has it already been written".
 //
 // Pure (no Apple frameworks / no HealthKit) so it unit-tests on the CLI.
 
@@ -29,8 +34,9 @@ public enum SleepHealthGate {
 
     /// Whether a night is safe to mirror now. Ordinary drains still require the quiet margin above;
     /// an authoritative finalization signal (Sleep Focus ended) may write immediately. A finalization
-    /// signal never fabricates sleep: real segments are still required, and the Health watermark keeps
-    /// later flushes append-only if the ring subsequently contributes a small tail.
+    /// signal never fabricates sleep: real segments are still required. If the ring subsequently
+    /// contributes a small tail, that is a genuine staging change — `mirrorSettledNight`'s signature
+    /// check picks it up on the next flush and delete-and-replaces the night, same as any re-stage.
     public static func isReadyToWrite(latestSegmentEnd: Date?,
                                       now: Date,
                                       finalized: Bool,

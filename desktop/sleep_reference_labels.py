@@ -36,6 +36,12 @@ USAGE
     ./sleep_reference_labels.py               # re-read the last snapshot
     ./sleep_reference_labels.py --correlate   # run the tail-vs-awake co-location test
     ./sleep_reference_labels.py --export-groundtruth out.json   # for ringconn_sleep_fit.py
+    ./sleep_reference_labels.py --pull --audit-own   # docs/PENDING_VALIDATION.md check for
+                                                       # sleep-health-mirror-idempotent
+                                                       # (#health-sleep-mirror-duplicates) --
+                                                       # needs "Audit Apple Health sleep" run
+                                                       # on the phone first (Device Info ->
+                                                       # Diagnostics)
 """
 from __future__ import annotations
 
@@ -58,6 +64,12 @@ from sleep_awake_trace import (  # noqa: E402
 SAMPLES_KEY = "sleep.externalSamples"
 IMPORTED_AT_KEY = "sleep.externalSamplesImportedAt"
 WINDOW_KEY = "sleep.externalSamplesWindowDays"
+
+# OwnSleepCodec (#health-sleep-mirror-duplicates) -- written by Device Info -> Diagnostics ->
+# "Audit Apple Health sleep". Format: [[startUnix, endUnix, stageCode, appVersion], ...], SAME
+# stage codes as SAMPLES_KEY above (STAGE_FOR_CODE), since OwnSleepCodec deliberately reuses them.
+OWN_SAMPLES_KEY = "sleep.ownSamples"
+OWN_SAMPLES_AUDITED_AT_KEY = "sleep.ownSamplesAuditedAt"
 
 STORE_NAME = "default.store"
 STORE_FILES = [STORE_NAME, f"{STORE_NAME}-shm", f"{STORE_NAME}-wal"]
@@ -133,6 +145,115 @@ def load_labels(prefs):
             continue
         out.append((source, start, end, stage))
     return out
+
+
+def load_own_health_samples(prefs):
+    """[(start_unix, end_unix, stage, app_version), ...] from the cached OwnSleepCodec blob, or
+    None if never audited -- same None-vs-[] distinction as `load_labels`."""
+    raw = prefs.get(OWN_SAMPLES_KEY)
+    if raw is None:
+        return None
+    try:
+        rows = json.loads(bytes(raw).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        print("!! sleep.ownSamples is present but not readable JSON", file=sys.stderr)
+        return []
+    out = []
+    for row in rows:
+        if not (isinstance(row, list) and len(row) == 4):
+            continue
+        start, end, code, version = row
+        stage = STAGE_FOR_CODE.get(code)
+        if stage is None or not isinstance(start, int) or not isinstance(end, int) or end <= start:
+            continue
+        out.append((start, end, stage, version))
+    return out
+
+
+# --------------------------------------------------------------------------- --audit-own
+#
+# The audit for docs/PENDING_VALIDATION.md -> `sleep-health-mirror-idempotent`
+# (#health-sleep-mirror-duplicates): for each night we ourselves staged, compare what
+# `readOwnSleepSamples` found in Apple Health against the stored hypnogram. A clean mirror has
+# EXACTLY the stored segment count and zero same-stage overlapping pairs; the ratchet bug this
+# audits for leaves extra samples and non-zero overlaps. Ports `SleepHealthAudit.compare`
+# (OpenCircuitKit) step for step so the two report the same numbers.
+
+def _overlapping_same_stage_pairs(intervals):
+    """intervals: [(start, end, stage), ...], .inBed already excluded by the caller. O(n log n)
+    sweep per stage -- same algorithm as SleepHealthAudit.overlappingSameStagePairs."""
+    by_stage = {}
+    for s, e, st in intervals:
+        if e > s:
+            by_stage.setdefault(st, []).append((s, e))
+    pairs = 0
+    for group in by_stage.values():
+        group.sort()
+        running_end = None
+        for s, e in group:
+            if running_end is not None and s < running_end:
+                pairs += 1
+            running_end = max(running_end or e, e)
+    return pairs
+
+
+def _minutes_by_stage(intervals):
+    out = {}
+    for s, e, st in intervals:
+        if e > s:
+            out[st] = out.get(st, 0) + (e - s) / 60
+    return out
+
+
+def audit_own(store_path, prefs, tz):
+    """Print, per stored night, Health's own-sample count/overlaps against the stored hypnogram."""
+    health = load_own_health_samples(prefs)
+    audited_at = prefs.get(OWN_SAMPLES_AUDITED_AT_KEY)
+    print("\n--- Apple Health sleep audit (#health-sleep-mirror-duplicates) ---")
+    if audited_at:
+        print(f"last audited: {fmt(audited_at, tz)}")
+    if health is None:
+        print("!! never audited on the phone -- Device Info -> Diagnostics -> "
+              "'Audit Apple Health sleep', then re-run with --pull")
+        return
+    if not health:
+        print("audit cached, but EMPTY -- either Sleep read access is off for OpenCircuit, or "
+              "Health genuinely has none of our sleep for the audited window (ambiguous, same as "
+              "reference labels above).")
+    if not store_path.exists():
+        print(f"\n!! {store_path} not found -- pass --pull with the phone connected over USB")
+        return
+    nights = [n for n in load_own_nights(store_path) if n[2]]   # only nights with a stored hypnogram
+    if not nights:
+        print("no stored nights have a saved hypnogram yet")
+        return
+
+    PADDING = 4 * 3600   # matches DeviceInfoView.auditAppleHealthSleep's bucketing padding
+    dirty = 0
+    print(f"\n{'night':<12}{'health':>8}{'stored':>8}{'overlaps':>10}   versions")
+    print("-" * 60)
+    for in_bed_start, in_bed_end, segments in nights:
+        bucketed = [(s, e, st, v) for s, e, st, v in health
+                   if s < in_bed_end + PADDING and e > in_bed_start - PADDING]
+        health_staged = [(s, e, st) for s, e, st, _ in bucketed if st != "inBed"]
+        stored_staged = [(s, e, st) for s, e, st in segments if st != "inBed"]
+        overlaps = _overlapping_same_stage_pairs(health_staged)
+        clean = len(bucketed) == len(segments) and overlaps == 0
+        if not clean:
+            dirty += 1
+        versions = sorted({v for _, _, _, v in bucketed})
+        night_label = fmt(in_bed_end, tz)[:11]
+        mark = "  " if clean else "!!"
+        print(f"{mark}{night_label:<10}{len(bucketed):>8}{len(segments):>8}{overlaps:>10}   "
+              f"{', '.join(versions)}")
+        if not clean:
+            hm, sm = _minutes_by_stage(health_staged), _minutes_by_stage(stored_staged)
+            for st in sorted(set(hm) | set(sm)):
+                if abs(hm.get(st, 0) - sm.get(st, 0)) > 0.5:
+                    print(f"      {st}: health {hm.get(st, 0):.0f} min vs stored {sm.get(st, 0):.0f} min")
+
+    print(f"\n{dirty} of {len(nights)} night(s) NOT clean." if dirty
+          else f"\nall {len(nights)} night(s) clean.")
 
 
 def report(labels, prefs, tz):
@@ -555,6 +676,10 @@ def main():
                     help="reproduce SLEEP_AWAKE_RESOLUTION §4.1: our own interior/edge awake "
                          "split per stored night, beside each reference source's awake total "
                          "(needs the SwiftData store -- pulled automatically with --pull)")
+    ap.add_argument("--audit-own", action="store_true",
+                    help="docs/PENDING_VALIDATION.md 'sleep-health-mirror-idempotent' check "
+                         "(#health-sleep-mirror-duplicates): per stored night, compare Apple "
+                         "Health's own sample count/overlaps against the stored hypnogram")
     ap.add_argument("--sweep-arousal-cut", nargs="?", const="", metavar="C1,C2,...",
                     help="fit Tuning.arousalIntensityCut (SLEEP_INTERIOR_AROUSALS.md §4): "
                          "simulate markInteriorArousals at each comma-separated cut and print "
@@ -590,6 +715,9 @@ def main():
 
     if args.compare_own:
         compare_own(labels, args.dir / STORE_NAME, tz)
+
+    if args.audit_own:
+        audit_own(args.dir / STORE_NAME, prefs, tz)
 
     if args.sweep_arousal_cut is not None:
         cuts = ([int(c.strip()) for c in args.sweep_arousal_cut.split(",")] if args.sweep_arousal_cut

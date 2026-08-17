@@ -8,7 +8,11 @@ import OpenCircuitKit
 
 @MainActor
 final class HealthKitWriter {
-    private let store = HKHealthStore()
+    // Injectable (test: `HealthStoring.swift`, `sleep-health-mirror-duplicates`) so the sleep-mirror
+    // write/verify/delete logic (`mirrorSettledNight`) can run against a fake store in unit tests —
+    // a real `HKHealthStore` can't be driven deterministically off-device. Every production call
+    // site constructs `HealthKitWriter()` with no argument, so this is a behavior-free change there.
+    private let store: HealthStoring
     private static let systolicType = HKQuantityType(.bloodPressureSystolic)
     private static let diastolicType = HKQuantityType(.bloodPressureDiastolic)
     private static let bloodPressureType = HKCorrelationType.correlationType(forIdentifier: .bloodPressure)!
@@ -19,6 +23,10 @@ final class HealthKitWriter {
     /// background-task `HealthKitWriter` instances too (both run on the MainActor, which reads/
     /// writes this synchronously around the awaits — they share one underlying SQLite store).
     private static var isFlushing = false
+
+    init(store: HealthStoring = HKHealthStore()) {
+        self.store = store
+    }
 
     static var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
@@ -298,6 +306,11 @@ final class HealthKitWriter {
             }
             pendingFlushFailures.formUnion(outcome.failed)
         }
+        // Retry any DELETE `mirrorSettledNight` couldn't verify on a prior flush
+        // (#health-sleep-mirror-duplicates) BEFORE the ordinary mirror step below, so a successful
+        // repair updates `MirroredNightOverlay` first and the mirror's own pending-repair guard sees
+        // it — otherwise an unchanged night would re-enter the write path and add another duplicate.
+        await drainPendingSleepRepairs(local: store)
         // Sleep: mirror the SETTLED night to Health (SleepHealthGate) — with periodic overnight
         // draining the staged night grows as epochs arrive, so an in-progress night is held back
         // behind the quiet margin. A night also routinely RE-STAGES hours after wake (denser data /
@@ -309,7 +322,10 @@ final class HealthKitWriter {
         if SleepHealthGate.isReadyToWrite(latestSegmentEnd: sleepSegments.map(\.end).max(),
                                           now: Date(), finalized: sleepFinalized) {
             switch await mirrorSettledNight(local: store, segments: sleepSegments) {
-            case .wrote(let count):
+            case .wrote(let count), .wroteNeedsRepair(let count):
+                // Both landed the correct night in Health (write-first) — `.wroteNeedsRepair` only
+                // means the STALE copy's removal is still pending, which `drainPendingSleepRepairs`
+                // retries on the next flush. Nothing here for the card to call "unsynced".
                 result.sleepSegments = count
                 writtenKinds.insert(.sleep)
             case .unchanged:
@@ -779,19 +795,9 @@ final class HealthKitWriter {
         guard let ownBundleID = Bundle.main.bundleIdentifier else {
             return HeadacheReadResult(external: [], ownSourceCount: 0)
         }
-        let predicate = HKQuery.predicateForSamples(withStart: since, end: nil, options: [])
-        let samples: [HKCategorySample] = await withCheckedContinuation { cont in
-            let query = HKSampleQuery(
-                sampleType: HKCategoryType(.headache), predicate: predicate,
-                limit: HKObjectQueryNoLimit,
-                sortDescriptors: [NSSortDescriptor(keyPath: \HKSample.startDate, ascending: true)]
-            ) { _, result, _ in
-                // The error is dropped deliberately: a denied read reports no error, only an empty
-                // result, so an error branch could not tell the two apart anyway (see above).
-                cont.resume(returning: (result as? [HKCategorySample]) ?? [])
-            }
-            store.execute(query)
-        }
+        // The error is dropped deliberately: a denied read reports no error, only an empty result,
+        // so an error branch could not tell the two apart anyway (see above).
+        let samples = await store.headacheSamples(since: since)
         let ownSource = samples.filter { $0.sourceRevision.source.bundleIdentifier == ownBundleID }
         let external = samples.compactMap { sample -> ImportedHeadache? in
             guard sample.sourceRevision.source.bundleIdentifier != ownBundleID else { return nil }
@@ -829,27 +835,34 @@ final class HealthKitWriter {
     /// unstaged-asleep bucket. It is NOT dropped — an interval we know was asleep still constrains
     /// the awake comparison this exists for.
     func readExternalSleepSamples(from start: Date, to end: Date? = nil) async -> [ExternalSleepSample] {
-        guard Self.isAvailable, let ownBundleID = Bundle.main.bundleIdentifier else { return [] }
-        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
-        let samples: [HKCategorySample] = await withCheckedContinuation { cont in
-            let query = HKSampleQuery(
-                sampleType: HKCategoryType(.sleepAnalysis), predicate: predicate,
-                limit: HKObjectQueryNoLimit,
-                sortDescriptors: [NSSortDescriptor(keyPath: \HKSample.startDate, ascending: true)]
-            ) { _, result, _ in
-                cont.resume(returning: (result as? [HKCategorySample]) ?? [])
-            }
-            store.execute(query)
-        }
+        guard Self.isAvailable else { return [] }
+        let samples = await store.externalSleepSamples(from: start, to: end)
         return samples.compactMap { sample -> ExternalSleepSample? in
-            guard sample.sourceRevision.source.bundleIdentifier != ownBundleID,
-                  sample.endDate > sample.startDate,
+            guard sample.endDate > sample.startDate,
                   let stage = Self.sleepStage(forHealthKitValue: sample.value)
             else { return nil }
             return ExternalSleepSample(source: sample.sourceRevision.source.name,
                                        start: sample.startDate,
                                        end: sample.endDate,
                                        stage: stage)
+        }
+    }
+
+    /// Read OUR OWN sleep-stage samples back out of HealthKit — the audit instrument for
+    /// `docs/PENDING_VALIDATION.md` → `sleep-health-mirror-idempotent`, and the verification step
+    /// `mirrorSettledNight` uses to confirm a delete actually removed the prior copy (rather than
+    /// trusting the call succeeded and moving on, which is the bug this exists to close). Same
+    /// HONEST EMPTY caveat as `readExternalSleepSamples`: a denied read and "nothing there" are
+    /// indistinguishable, so `[]` here must never be reported as "Health has no OpenCircuit sleep".
+    func readOwnSleepSamples(from start: Date, to end: Date? = nil) async -> [OwnSleepSample] {
+        guard Self.isAvailable else { return [] }
+        let samples = await store.ownSleepSamples(from: start, to: end)
+        return samples.compactMap { sample -> OwnSleepSample? in
+            guard sample.endDate > sample.startDate,
+                  let stage = Self.sleepStage(forHealthKitValue: sample.value)
+            else { return nil }
+            return OwnSleepSample(start: sample.startDate, end: sample.endDate, stage: stage,
+                                  appVersion: sample.sourceRevision.version ?? "unknown")
         }
     }
 
@@ -1801,7 +1814,13 @@ final class HealthKitWriter {
         return surviving
     }
 
-    enum MirrorOutcome { case wrote(Int); case unchanged; case failed }
+    enum MirrorOutcome { case wrote(Int); case wroteNeedsRepair(Int); case unchanged; case failed }
+
+    /// Auto-retry cap for `drainPendingSleepRepairs` — a persistently failing delete is a systemic
+    /// issue, not a transient one, so stop spending a HealthKit call on it every flush once this many
+    /// tries have failed. The marker is left in place (untouched by the cap) so "Rebuild Apple Health
+    /// sleep" (DeviceInfoView) can still force it, and a genuine re-stage still supersedes it.
+    static let maxSleepRepairAttempts = 5
 
     /// Mirror a SETTLED, non-edited night into Apple Health so it tracks the CARD — the merge-protected
     /// `StoredSleepSummary`, not the raw drain. The ordinary flush used to append behind the forward
@@ -1824,10 +1843,18 @@ final class HealthKitWriter {
     /// spans — EXCLUDING the fresh write and every Health-written nap window (so naps, other nights, and
     /// other apps are never touched). Anchoring to the durable summary span (not just this drain's
     /// segments) means a wider prior write, or one made before this overlay existed, is still cleaned.
-    /// The signature is recorded even if the delete throws (write-first already put the correct night in
-    /// Health) to avoid per-flush rewrite churn; the leftover duplicate — de-overlapped by Health in the
-    /// "time asleep" total — is cleared by the next re-stage's union delete. Assumes the Health-write
-    /// gate (`Self.isFlushing`) is HELD by the caller.
+    ///
+    /// VERIFY-THEN-RECORD (#health-sleep-mirror-duplicates). The signature used to be recorded
+    /// REGARDLESS of whether the delete succeeded — on the theory that Health de-overlaps duplicates
+    /// in its totals and the next re-stage's union delete would mop them up. It doesn't: recording the
+    /// signature makes `last?.signature == signature` true on the very next flush, which short-circuits
+    /// BEFORE any delete is attempted again — so a delete that failed once (for whatever HealthKit
+    /// reason) was never retried, and every subsequent re-stage's write-first step added yet another
+    /// full copy on top of the stuck one. Measured on-device: 4 of 5 stored nights had accumulated
+    /// copies this way (see the branch's plan). Now the signature is recorded ONLY after a post-delete
+    /// COUNT confirms the prior copy is actually gone; a mismatch instead persists a `PendingSleepRepair`
+    /// that `drainPendingSleepRepairs` retries — deleting only, never re-writing, since `fresh` already
+    /// holds the correct samples. Assumes the Health-write gate (`Self.isFlushing`) is HELD by the caller.
     func mirrorSettledNight(local: LocalStore, segments: [SleepSegment]) async -> MirrorOutcome {
         guard let start = segments.map(\.start).min(),
               let end = segments.map(\.end).max(), end > start else { return .unchanged }
@@ -1861,6 +1888,13 @@ final class HealthKitWriter {
 
         let signature = Self.sleepSignature(segments)
         let last = local.mirroredNight(night: night)
+        // A repair is already outstanding for THIS EXACT staging: the write it left behind (`fresh`,
+        // tracked in the marker) is already correct, only the delete side is unresolved. Re-entering
+        // the write path here would only add another duplicate on top of the one the repair is trying
+        // to clean up — leave it to `drainPendingSleepRepairs` (run earlier this same flush).
+        if let pendingRepair = local.pendingSleepRepair(night: night), pendingRepair.signature == signature {
+            return .unchanged
+        }
         // Health already reflects this exact staging — nothing to do (the common steady-state).
         if last?.signature == signature { return .unchanged }
 
@@ -1880,20 +1914,131 @@ final class HealthKitWriter {
         let cleanStart = min(start, last?.spanStart ?? start, row?.inBedStart ?? start)
         let cleanEnd = max(end, last?.spanEnd ?? end, row?.inBedEnd ?? end)
         let napWindows = local.healthWrittenNapWindows(overlapping: cleanStart, to: cleanEnd)
-        // Record the signature regardless of the delete's outcome: the correct night is already in
-        // Health (write-first), so recording avoids re-writing it every flush. A delete failure leaves
-        // a duplicate that Health de-overlaps in the asleep total and that the next re-stage's union
-        // delete removes; retrying the whole write would only pile up more duplicates.
+        // 3. VERIFY-THEN-RECORD (see the doc comment above): only trust the delete once a fresh count
+        //    of our own samples in the cleaned span confirms nothing but `fresh` remains.
+        var deleted = true
         do {
             try await deleteNightSleep(from: cleanStart, to: cleanEnd,
                                        napWindows: napWindows, keeping: fresh)
         } catch {
-            // best-effort; see note above
+            deleted = false
         }
-        local.setMirroredNight(night: night, signature: signature, spanStart: cleanStart, spanEnd: cleanEnd)
+        var verifiedClean = false
+        if deleted {
+            let remaining = await ownSleepCount(from: cleanStart, to: cleanEnd, excludingNapWindows: napWindows)
+            verifiedClean = remaining == fresh.count
+        }
+        if verifiedClean {
+            local.clearPendingSleepRepair(night: night)
+            local.setMirroredNight(night: night, signature: signature, spanStart: cleanStart, spanEnd: cleanEnd)
+        } else {
+            local.setPendingSleepRepair(night: night, cleanStart: cleanStart, cleanEnd: cleanEnd,
+                                        keepUUIDs: fresh, signature: signature)
+        }
         try? local.forceSleepCursorAtLeast(end)
         try? local.markSleepEditHealthCovered(by: segments)
-        return .wrote(segments.count)
+        return verifiedClean ? .wrote(segments.count) : .wroteNeedsRepair(segments.count)
+    }
+
+    /// Count OUR OWN sleep samples in `[start, end]` that fall outside every `napWindows` entry — the
+    /// same scope `deleteNightSleep`'s predicate targets. Used to VERIFY a delete actually worked
+    /// (#health-sleep-mirror-duplicates) instead of trusting a non-throwing call. Overlap test matches
+    /// `HKQuery.predicateForSamples`'s default (any overlap counts, not full containment).
+    private func ownSleepCount(from start: Date, to end: Date,
+                               excludingNapWindows napWindows: [DateInterval]) async -> Int {
+        guard end > start else { return 0 }
+        let samples = await readOwnSleepSamples(from: start, to: end)
+        return samples.filter { sample in
+            !napWindows.contains { sample.start < $0.end && sample.end > $0.start }
+        }.count
+    }
+
+    /// Retry-only-the-DELETE for nights `mirrorSettledNight` couldn't verify were cleaned up. Never
+    /// re-writes: the fresh samples from the original write (`keepUUIDs`) are already correct
+    /// (write-first), so retrying the write here would only create yet another duplicate — the whole
+    /// point of this being a separate path from `mirrorSettledNight`. Call BEFORE the ordinary mirror
+    /// step each flush, so a successful repair updates `MirroredNightOverlay` first and the mirror's
+    /// own pending-repair guard (above) sees it. Assumes the Health-write gate is held by the caller.
+    /// Internal (not `private`), same reasoning as `mirrorSettledNight`/`sleepSignature`: tests drive
+    /// it directly (`SleepHealthMirrorRatchetTests`) rather than only through `flushToHealth`'s full
+    /// pipeline, which drags in unrelated dependencies (`isShareAuthorized`, scalar writes, …).
+    func drainPendingSleepRepairs(local: LocalStore) async {
+        for pending in local.pendingSleepRepairs() {
+            guard pending.attempts < Self.maxSleepRepairAttempts else { continue }
+            let napWindows = local.healthWrittenNapWindows(overlapping: pending.cleanStart,
+                                                            to: pending.cleanEnd)
+            var deleted = true
+            do {
+                try await deleteNightSleep(from: pending.cleanStart, to: pending.cleanEnd,
+                                           napWindows: napWindows, keeping: pending.keepUUIDs)
+            } catch {
+                deleted = false
+            }
+            var verifiedClean = false
+            if deleted {
+                let remaining = await ownSleepCount(from: pending.cleanStart, to: pending.cleanEnd,
+                                                    excludingNapWindows: napWindows)
+                verifiedClean = remaining == pending.keepUUIDs.count
+            }
+            if verifiedClean {
+                local.setMirroredNight(night: pending.night, signature: pending.signature,
+                                       spanStart: pending.cleanStart, spanEnd: pending.cleanEnd)
+                local.clearPendingSleepRepair(night: pending.night)
+            } else {
+                local.incrementSleepRepairAttempt(night: pending.night)
+            }
+        }
+    }
+
+    /// Force a night's Apple Health sleep to exactly match its stored hypnogram, bypassing
+    /// `mirrorSettledNight`'s "nothing changed" short-circuit — used ONLY by the user-triggered
+    /// "Rebuild Apple Health sleep" repair (DeviceInfoView), for nights the ratchet bug
+    /// (#health-sleep-mirror-duplicates) already polluted before the fix landed. Same write-first,
+    /// delete-then-verify shape as `mirrorSettledNight`, over the union of the night's recorded
+    /// in-bed span and any span this app has EVER mirrored for it — wider than an ordinary mirror's
+    /// span, so a rebuild also catches copies written under a signature this night no longer has, or
+    /// by a build before the union-span widening existed. Skips (returns nil) a manually-edited
+    /// night — never overwrite a user's edit — or a night with nothing stored to write back.
+    /// Otherwise returns whether the post-verify count confirmed a clean rebuild (`true`) or left one
+    /// more pass pending as a `PendingSleepRepair` — same as the ordinary mirror — for
+    /// `drainPendingSleepRepairs` to pick up on the next flush (`false`).
+    func rebuildNightSleep(local: LocalStore, night: Date, segments: [SleepSegment]) async -> Bool? {
+        guard !segments.isEmpty else { return nil }
+        guard let row = try? local.sleepSummary(night: night), row.isManuallyEdited == false else { return nil }
+
+        let fresh: [String]
+        do { fresh = try await writeReturningSleepUUIDs(segments) }
+        catch { return nil }
+
+        // An edit could have landed during the write's await — leave it to the edit reconcile, same
+        // race guard `mirrorSettledNight` uses.
+        if (try? local.sleepSummary(night: night))?.isManuallyEdited == true { return nil }
+
+        let last = local.mirroredNight(night: night)
+        let cleanStart = min(row.inBedStart, last?.spanStart ?? row.inBedStart)
+        let cleanEnd = max(row.inBedEnd, last?.spanEnd ?? row.inBedEnd)
+        let napWindows = local.healthWrittenNapWindows(overlapping: cleanStart, to: cleanEnd)
+        var deleted = true
+        do {
+            try await deleteNightSleep(from: cleanStart, to: cleanEnd,
+                                       napWindows: napWindows, keeping: fresh)
+        } catch {
+            deleted = false
+        }
+        var verifiedClean = false
+        if deleted {
+            let remaining = await ownSleepCount(from: cleanStart, to: cleanEnd, excludingNapWindows: napWindows)
+            verifiedClean = remaining == fresh.count
+        }
+        let signature = Self.sleepSignature(segments)
+        if verifiedClean {
+            local.setMirroredNight(night: night, signature: signature, spanStart: cleanStart, spanEnd: cleanEnd)
+            local.clearPendingSleepRepair(night: night)
+        } else {
+            local.setPendingSleepRepair(night: night, cleanStart: cleanStart, cleanEnd: cleanEnd,
+                                        keepUUIDs: fresh, signature: signature)
+        }
+        return verifiedClean
     }
 
     /// Delete this app's sleep samples in `[start, end]`, EXCLUDING the freshly-written samples and
