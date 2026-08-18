@@ -513,6 +513,13 @@ struct DeviceInfoView: View {
     /// hypnogram — the audit instrument for `docs/PENDING_VALIDATION.md` →
     /// `sleep-health-mirror-idempotent`. Read-only; the result is cached via `OwnSleepStore` so
     /// `desktop/sleep_reference_labels.py --audit-own` can read it off a `--pull`.
+    ///
+    /// ⚠️ Same HONEST EMPTY caveat as `importExternalSleep` above: HealthKit never reports read
+    /// authorization, so `health.isEmpty` is ambiguous between "Sleep read access is off for us" and
+    /// "Health genuinely has nothing of ours". Without a special case, that ambiguity would render as
+    /// every night "dirty" and point the user at Rebuild — which deletes real Health data — for a
+    /// read-permission problem Rebuild cannot fix. Handled below by checking `health.isEmpty` BEFORE
+    /// composing the summary, same stance `desktop/sleep_reference_labels.py:audit_own` takes.
     private func auditAppleHealthSleep() {
         sleepAuditResult = "Reading…"
         Task { @MainActor in
@@ -552,10 +559,20 @@ struct DeviceInfoView: View {
                         + "pairs\(versions)")
                 }
             }
-            sleepAuditResult = (dirty == 0
-                ? "All \(nights.count) night\(nights.count == 1 ? "" : "s") clean.\n"
-                : "\(dirty) of \(nights.count) night\(nights.count == 1 ? "" : "s") have duplicates — "
-                    + "tap Rebuild to fix.\n") + lines.joined(separator: "\n")
+            let summary: String
+            if health.isEmpty {
+                summary = "Health returned NO OpenCircuit sleep at all across "
+                    + "\(nights.count) night\(nights.count == 1 ? "" : "s") — ambiguous between "
+                    + "\"Sleep read access is off for OpenCircuit\" and \"Health genuinely has none of "
+                    + "our sleep\" (HealthKit never reports read denial). Check Health → Sharing → Apps "
+                    + "→ OpenCircuit before tapping Rebuild.\n"
+            } else if dirty == 0 {
+                summary = "All \(nights.count) night\(nights.count == 1 ? "" : "s") clean.\n"
+            } else {
+                summary = "\(dirty) of \(nights.count) night\(nights.count == 1 ? "" : "s") have "
+                    + "duplicates — tap Rebuild to fix.\n"
+            }
+            sleepAuditResult = summary + lines.joined(separator: "\n")
         }
     }
 

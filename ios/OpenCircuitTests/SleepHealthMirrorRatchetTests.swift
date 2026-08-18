@@ -9,8 +9,8 @@ import OpenCircuitKit
 /// signature even when the delete failed. That silenced every future retry (the next flush's
 /// `last?.signature == signature` short-circuit fired immediately) and let every subsequent
 /// re-stage pile another full copy of the night on top of the one still stuck in Health. Measured
-/// on-device: 4 of the 5 stored nights had accumulated copies this way — see the branch plan for
-/// the sample dump that found it.
+/// on-device: 4 of the 5 stored nights had accumulated copies this way — see
+/// `docs/PENDING_VALIDATION.md` → `sleep-health-mirror-idempotent` for the sample dump that found it.
 @MainActor
 final class SleepHealthMirrorRatchetTests: XCTestCase {
     private var containers: [ModelContainer] = []
@@ -200,6 +200,38 @@ final class SleepHealthMirrorRatchetTests: XCTestCase {
         guard case .wroteNeedsRepair = outcome else { return XCTFail("expected .wroteNeedsRepair, got \(outcome)") }
         XCTAssertNotNil(store.pendingSleepRepair(night: night),
                         "a non-throwing delete that leaves a straggler must still be treated as unverified")
+    }
+
+    /// A staged segment that happens to fall inside a previously-mirrored nap window must not
+    /// permanently block verification. `ownSleepCount` (production) EXCLUDES nap-window overlaps from
+    /// its remaining count — the same scope `deleteNightSleep`'s predicate protects — so the expected
+    /// count compared against it must be nap-filtered the same way. Before the fix this compared
+    /// against the unfiltered `fresh.count`, so a night whose staging ever overlapped a nap could
+    /// never verify clean and would burn every repair attempt into a permanently stuck marker
+    /// (#health-sleep-mirror-duplicates, review finding 2a).
+    func testSegmentOverlappingANapWindowStillVerifiesClean() async throws {
+        let inBedStart = at(0), inBedEnd = at(8)
+        let store = try makeStore()
+        try seedNight(store, inBedStart: inBedStart, inBedEnd: inBedEnd)
+        let segments = [
+            seg(0, 480, .inBed, base: inBedStart),
+            seg(0, 240, .asleepCore, base: inBedStart),
+            seg(240, 480, .asleepDeep, base: inBedStart),
+        ]
+        // A nap this app already mirrored to Health, overlapping the first 30 minutes of the night —
+        // excluded from `deleteNightSleep`'s predicate and from `ownSleepCount`'s verify count, so any
+        // fresh sample landing inside it (the `.inBed` and first `.asleepCore` segments here both do)
+        // must also be excluded from the EXPECTED count, not just the observed one.
+        let nap = StoredNap(start: at(0), end: at(0.5), healthWritten: true)
+        store.context.insert(nap)
+        try store.context.save()
+
+        let fake = FakeHealthStore()
+        let writer = HealthKitWriter(store: fake)
+        let outcome = await writer.mirrorSettledNight(local: store, segments: segments)
+        guard case .wrote = outcome else {
+            return XCTFail("a segment overlapping a nap window must still verify clean, got \(outcome)")
+        }
     }
 
     // MARK: - Rebuild skips nights with nothing to write back

@@ -1851,7 +1851,8 @@ final class HealthKitWriter {
     /// BEFORE any delete is attempted again — so a delete that failed once (for whatever HealthKit
     /// reason) was never retried, and every subsequent re-stage's write-first step added yet another
     /// full copy on top of the stuck one. Measured on-device: 4 of 5 stored nights had accumulated
-    /// copies this way (see the branch's plan). Now the signature is recorded ONLY after a post-delete
+    /// copies this way (`docs/PENDING_VALIDATION.md` → `sleep-health-mirror-idempotent`). Now the
+    /// signature is recorded ONLY after a post-delete
     /// COUNT confirms the prior copy is actually gone; a mismatch instead persists a `PendingSleepRepair`
     /// that `drainPendingSleepRepairs` retries — deleting only, never re-writing, since `fresh` already
     /// holds the correct samples. Assumes the Health-write gate (`Self.isFlushing`) is HELD by the caller.
@@ -1926,7 +1927,8 @@ final class HealthKitWriter {
         var verifiedClean = false
         if deleted {
             let remaining = await ownSleepCount(from: cleanStart, to: cleanEnd, excludingNapWindows: napWindows)
-            verifiedClean = remaining == fresh.count
+            let expected = expectedOwnSampleCount(segments: segments, excludingNapWindows: napWindows)
+            verifiedClean = remaining == expected
         }
         if verifiedClean {
             local.clearPendingSleepRepair(night: night)
@@ -1950,6 +1952,22 @@ final class HealthKitWriter {
         let samples = await readOwnSleepSamples(from: start, to: end)
         return samples.filter { sample in
             !napWindows.contains { sample.start < $0.end && sample.end > $0.start }
+        }.count
+    }
+
+    /// The write-side counterpart to `ownSleepCount`'s nap exclusion: how many of `segments` a clean
+    /// verify should actually find. `writeReturningSleepUUIDs` writes one sample per segment, but a
+    /// segment that happens to fall inside a previously-mirrored nap window is EXCLUDED from
+    /// `ownSleepCount`'s read (the same reason `deleteNightSleep` excludes nap windows from its delete
+    /// predicate — see `healthWrittenNapWindows`'s doc comment). Comparing a nap-unfiltered `fresh.count`
+    /// against a nap-filtered `ownSleepCount` result meant a night whose staging ever overlapped a nap
+    /// could never verify clean: `remaining` was permanently short by the nap-overlapping segments,
+    /// `verifiedClean` never became true, and the night burned all `maxSleepRepairAttempts` into a
+    /// stuck `PendingSleepRepair` that nothing but a manual "Rebuild Apple Health sleep" could clear.
+    private func expectedOwnSampleCount(segments: [SleepSegment],
+                                        excludingNapWindows napWindows: [DateInterval]) -> Int {
+        segments.filter { segment in
+            !napWindows.contains { segment.start < $0.end && segment.end > $0.start }
         }.count
     }
 
@@ -1978,7 +1996,17 @@ final class HealthKitWriter {
             if deleted {
                 let remaining = await ownSleepCount(from: pending.cleanStart, to: pending.cleanEnd,
                                                     excludingNapWindows: napWindows)
-                verifiedClean = remaining == pending.keepUUIDs.count
+                // `PendingSleepRepair` only stores UUIDs, not the segments that produced them — the
+                // current hypnogram is the same staging (`upsert` replaces any outstanding repair the
+                // instant a newer one is set, so the marker still on file matches `pending.signature`,
+                // and `pending.signature` is a signature of exactly these segments). Fall back to the
+                // unfiltered UUID count only if the night's hypnogram somehow isn't there any more, so
+                // a repair never gets permanently stuck on a missing lookup either.
+                let stagedSegments = local.hypnogram(night: pending.night)
+                let expected = stagedSegments.isEmpty
+                    ? pending.keepUUIDs.count
+                    : expectedOwnSampleCount(segments: stagedSegments, excludingNapWindows: napWindows)
+                verifiedClean = remaining == expected
             }
             if verifiedClean {
                 local.setMirroredNight(night: pending.night, signature: pending.signature,
@@ -2002,9 +2030,25 @@ final class HealthKitWriter {
     /// Otherwise returns whether the post-verify count confirmed a clean rebuild (`true`) or left one
     /// more pass pending as a `PendingSleepRepair` — same as the ordinary mirror — for
     /// `drainPendingSleepRepairs` to pick up on the next flush (`false`).
+    ///
+    /// UNLIKE `mirrorSettledNight`/`drainPendingSleepRepairs`, this does NOT assume the Health-write
+    /// gate is held by the caller — it's reachable from a UI button tap (`DeviceInfoView`), not the
+    /// periodic flush, so nothing upstream holds `Self.isFlushing` for it. Takes the same
+    /// wait-then-gate as `reconcileEditedNightSleep`, so a rebuild can never interleave writes/deletes
+    /// over the same night's sleep with a concurrent flush. If the gate is still held after the wait,
+    /// this simply skips (returns nil, same as any other rebuild failure) rather than deferring like
+    /// the flush's own reconcile does — a user-triggered rebuild is easy to just tap again.
     func rebuildNightSleep(local: LocalStore, night: Date, segments: [SleepSegment]) async -> Bool? {
         guard !segments.isEmpty else { return nil }
         guard let row = try? local.sleepSummary(night: night), row.isManuallyEdited == false else { return nil }
+
+        var waited = 0
+        while Self.isFlushing, waited < 40 {
+            try? await Task.sleep(nanoseconds: 50_000_000); waited += 1
+        }
+        guard !Self.isFlushing else { return nil }
+        Self.isFlushing = true
+        defer { Self.isFlushing = false }
 
         let fresh: [String]
         do { fresh = try await writeReturningSleepUUIDs(segments) }
@@ -2028,7 +2072,8 @@ final class HealthKitWriter {
         var verifiedClean = false
         if deleted {
             let remaining = await ownSleepCount(from: cleanStart, to: cleanEnd, excludingNapWindows: napWindows)
-            verifiedClean = remaining == fresh.count
+            let expected = expectedOwnSampleCount(segments: segments, excludingNapWindows: napWindows)
+            verifiedClean = remaining == expected
         }
         let signature = Self.sleepSignature(segments)
         if verifiedClean {
