@@ -210,35 +210,48 @@ there is no denominator.
 - check-after: 2026-08-15 (same day — no longer needs to wait for morning; a forced reconnect is
   sufficient, see `check` above)
 
-### The sleep-mirror ratchet fix has never survived a real re-stage cycle
-- id: sleep-health-mirror-idempotent
-- shipped: `fix/health-sleep-mirror-duplicates` 2026-08-17 (#health-sleep-mirror-duplicates) —
-  `HealthKitWriter.mirrorSettledNight` now only records a night's mirror signature after a
-  post-delete COUNT confirms the prior copy is actually gone (`ownSleepCount`), instead of
-  recording it unconditionally the moment the delete call returned. A verify failure persists a
-  `PendingSleepRepair` that `drainPendingSleepRepairs` retries — delete only, never re-write — on
-  the next flush.
-- claim: after this fix, a night that re-stages (the routine once-a-morning fuller re-stage, or any
-  later re-classification) leaves Apple Health holding EXACTLY the stored hypnogram's samples —
-  no accumulated duplicate from a delete that silently failed
-- needs: at least one overnight sleep + at least one re-stage of that night (the ordinary morning
-  re-stage counts) on a device running the fixed build
-- blocked-because: the fix landed same-session, off a diagnosis built entirely from a
-  ALREADY-PULLED snapshot (`desktop/captures/device-snapshot-2026-08-17/`) — no flush has run
-  against the fixed code yet. That snapshot IS the evidence the bug existed (4 of 5 stored nights'
-  recomputed `sleepSignature` no longer matched what the pre-fix mirror had recorded), but it
-  cannot confirm the fix, only the problem.
-- check: on the phone, Device Info → Diagnostics → "Audit Apple Health sleep" (new, ships with this
-  fix), then `desktop/sleep_reference_labels.py --pull --audit-own`
-- passes-if: for the night that re-staged since install, `--audit-own` reports Health's own-sample
-  count equal to the stored hypnogram's segment count, zero same-stage overlapping pairs, and (if
-  the night was already dirty from before the fix) a SINGLE app version in the "versions" column
-  after running Diagnostics → "Rebuild Apple Health sleep" once
-- check-after: 2026-08-18
-
 ---
 
 ## Settled
+
+### The sleep-mirror ratchet survived a real re-stage cycle — 2026-08-18
+- id: sleep-health-mirror-idempotent
+- was: after `fix/health-sleep-mirror-duplicates` (2026-08-17, #health-sleep-mirror-duplicates) —
+  `HealthKitWriter.mirrorSettledNight` records a night's mirror signature only once a post-delete
+  COUNT confirms the prior copy is gone (`ownSleepCount`), with a verify failure persisting a
+  `PendingSleepRepair` that `drainPendingSleepRepairs` retries delete-only on the next flush —
+  does a night that re-stages leave Apple Health holding EXACTLY the stored hypnogram's samples,
+  with no duplicate accumulated from a delete that silently failed?
+- observed: Diagnostics → "Audit Apple Health sleep" on-device at `08-18 12:47:16`, then
+  `desktop/sleep_reference_labels.py --pull --audit-own`. The 08-18 night was slept, staged, and
+  re-staged by the ordinary morning re-stage on a build installed 08-17 carrying the ratchet —
+  the first post-fix re-stage cycle. All six mirrored nights clean, Health own-sample count equal
+  to stored segment count with zero same-stage overlapping pairs throughout:
+
+  ```
+  night         health  stored  overlaps   versions
+    08-13 08:09      32      32         0   41
+    08-14 08:16      27      27         0   41
+    08-15 08:23      59      59         0   41
+    08-16 06:02      38      38         0   41
+    08-17 08:24      39      39         0   41
+    08-18 08:10      76      76         0   41
+  all 6 night(s) clean.
+  ```
+
+  `sleep.health.pending-repair.v1` is `[]` — no verify ever failed, so the repair queue was never
+  exercised — and exactly one `sleep.mirror.night.*` signature is recorded per night. The four
+  nights whose recomputed `sleepSignature` had drifted from the pre-fix mirror in
+  `device-snapshot-2026-08-17/` (the evidence the bug was real) are now consistent.
+- caveat: the `versions` column carries NO signal here — `CURRENT_PROJECT_VERSION` was not bumped
+  for this fix, so pre- and post-fix builds both stamp 41. That clause of the original passes-if
+  was trivially satisfied and is not part of what confirmed this.
+- still open: the failure limb is unconfirmed. A clean run never enters the verify-failed branch,
+  so `PendingSleepRepair` persistence and `drainPendingSleepRepairs`' delete-only retry have still
+  never run against a real failed delete. Also untested: the 2026-08-18 `0a15a3e` revision (review
+  findings + gating "Rebuild Apple Health sleep" on the Health-write lock) landed AFTER the
+  re-stage that confirmed this, so what the 08-18 night exercised is the 08-17 ratchet mechanism,
+  not that revision's changes on top of it.
 
 ### The evidence fail-open branch fired for the first time — and it was a false positive — 2026-08-18
 - id: spo2-fail-open-miss
