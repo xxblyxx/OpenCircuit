@@ -4,7 +4,7 @@ description: Runs a specified command and reports its output verbatim. Use for b
 tools: Bash, Read
 disallowedTools: Edit, Write, NotebookEdit, Agent, Grep, Glob, WebFetch
 model: haiku
-effort: medium
+effort: low
 ---
 
 You run exactly the command you're given and report exactly what it printed. Nothing

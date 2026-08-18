@@ -387,6 +387,10 @@ enum MirroredNightOverlay {
         UserDefaults.standard.set(try? JSONEncoder().encode(record), forKey: key(night))
     }
 
+    static func clear(night: Date) {
+        UserDefaults.standard.removeObject(forKey: key(night))
+    }
+
     /// One-shot night-key migration hook — see `moveNightScopedDefault`. Without it every migrated
     /// night would look "never mirrored", and the next flush would delete-and-replace it in Apple
     /// Health for no reason.
@@ -454,6 +458,56 @@ enum PendingSleepReconcileStore {
             return moved
         }
         UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: key)
+    }
+}
+
+/// A night `mirrorSettledNight` wrote fresh sleep samples for but could NOT verify the prior copy
+/// was deleted (the delete threw, or a post-delete count came back over `keepUUIDs.count`) —
+/// #health-sleep-mirror-duplicates. `keepUUIDs` are the samples the write already landed (correct,
+/// write-first); this marker exists ONLY so the next flush retries the DELETE, never the write —
+/// re-writing here would just add another duplicate. `signature` guards `mirrorSettledNight` itself:
+/// while a repair for the CURRENT staging is outstanding, a repeat flush must not re-enter the write
+/// path either, so it checks this marker before comparing to `MirroredNightOverlay`. `attempts`
+/// caps automatic retries (`HealthKitWriter.maxSleepRepairAttempts`) so a systemic delete failure
+/// doesn't burn a HealthKit call every flush forever — the marker stays until a real re-stage
+/// supersedes it or "Rebuild Apple Health sleep" (DeviceInfoView) forces it.
+struct PendingSleepRepair: Codable, Equatable {
+    var night: Date
+    var cleanStart: Date
+    var cleanEnd: Date
+    var keepUUIDs: [String]
+    var signature: String
+    var attempts: Int
+}
+
+enum PendingSleepRepairStore {
+    private static let key = "sleep.health.pending-repair.v1"
+
+    static func all() -> [PendingSleepRepair] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([PendingSleepRepair].self, from: data)) ?? []
+    }
+
+    /// One marker per night — a fresh write attempt for the same night replaces whatever repair
+    /// was outstanding for it (that write's own delete supersedes the prior mess; see the union-span
+    /// reasoning in `mirrorSettledNight`), always starting `attempts` back at 0.
+    static func upsert(_ item: PendingSleepRepair) {
+        var items = all().filter { Calendar.current.isDate($0.night, inSameDayAs: item.night) == false }
+        items.append(item)
+        UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
+    }
+
+    static func incrementAttempt(night: Date) {
+        var items = all()
+        guard let idx = items.firstIndex(where: { Calendar.current.isDate($0.night, inSameDayAs: night) })
+        else { return }
+        items[idx].attempts += 1
+        UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
+    }
+
+    static func clear(night: Date) {
+        let items = all().filter { Calendar.current.isDate($0.night, inSameDayAs: night) == false }
+        UserDefaults.standard.set(try? JSONEncoder().encode(items), forKey: key)
     }
 }
 
@@ -1086,6 +1140,13 @@ struct LocalStore {
                                   night: night)
     }
 
+    /// Forget what was mirrored for `night` — test-only in practice today (resets the
+    /// `mirrorSettledNight` short-circuit to "never mirrored"); exposed on `LocalStore` rather than
+    /// left as a bare `MirroredNightOverlay` call so callers don't need to know the overlay exists.
+    func clearMirroredNight(night: Date) {
+        MirroredNightOverlay.clear(night: night)
+    }
+
     /// Persist a sleep-edit reconcile deferred because a flush held the Health gate (drained by the
     /// next flush). Keyed by night — a newer deferral for the same night supersedes the older.
     func setPendingSleepReconcile(night: Date, times: SleepEdit.Times, segments: [SleepSegment]) {
@@ -1110,6 +1171,34 @@ struct LocalStore {
         let current = PendingSleepReconcileStore.all()
             .first { Calendar.current.isDate($0.night, inSameDayAs: item.night) }
         if current == item { PendingSleepReconcileStore.clear(night: item.night) }
+    }
+
+    /// Record that a mirror's post-delete verification did NOT confirm the prior copy was removed
+    /// (#health-sleep-mirror-duplicates — see `PendingSleepRepair`). `keepUUIDs` are the samples the
+    /// write already landed; nothing here re-writes.
+    func setPendingSleepRepair(night: Date, cleanStart: Date, cleanEnd: Date,
+                               keepUUIDs: [String], signature: String) {
+        PendingSleepRepairStore.upsert(.init(night: night, cleanStart: cleanStart, cleanEnd: cleanEnd,
+                                             keepUUIDs: keepUUIDs, signature: signature, attempts: 0))
+    }
+
+    /// The one outstanding repair for `night`, if any — checked by `mirrorSettledNight` before it
+    /// would otherwise re-enter the write path for the same (unchanged) staging.
+    func pendingSleepRepair(night: Date) -> PendingSleepRepair? {
+        PendingSleepRepairStore.all().first { Calendar.current.isDate($0.night, inSameDayAs: night) }
+    }
+
+    /// Every outstanding repair, drained once per flush by `drainPendingSleepRepairs`.
+    func pendingSleepRepairs() -> [PendingSleepRepair] {
+        PendingSleepRepairStore.all()
+    }
+
+    func incrementSleepRepairAttempt(night: Date) {
+        PendingSleepRepairStore.incrementAttempt(night: night)
+    }
+
+    func clearPendingSleepRepair(night: Date) {
+        PendingSleepRepairStore.clear(night: night)
     }
 
     /// Windows of naps ALREADY mirrored to Apple Health that overlap `[start, end]`. The sleep-edit

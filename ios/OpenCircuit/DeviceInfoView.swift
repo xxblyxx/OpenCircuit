@@ -27,6 +27,11 @@ struct DeviceInfoView: View {
     @State private var showRepairImporter = false
     @State private var repairResult: String?
     @State private var externalSleepResult: String?
+    // Apple Health sleep audit + rebuild (#health-sleep-mirror-duplicates) — see `auditAppleHealthSleep`.
+    @State private var sleepAuditResult: String?
+    @State private var showRebuildConfirm = false
+    @State private var pendingRebuildNights: [Date] = []
+    @State private var rebuildResult: String?
     /// Set when the picked export's ring identity doesn't match this one — the merge waits on an
     /// explicit confirmation rather than silently polluting a per-ring archive.
     @State private var pendingForeignImport: (DiagnosticsFrameImport.Result, String, String)?
@@ -283,6 +288,31 @@ struct DeviceInfoView: View {
             if let externalSleepResult {
                 Text(externalSleepResult).font(.caption).foregroundStyle(.secondary)
             }
+            // Audit + repair for the sleep-mirror duplicate bug (#health-sleep-mirror-duplicates):
+            // reads OUR OWN sleep samples back out of Health and compares them, per night, against the
+            // stored hypnogram — the count/overlap mismatch a stuck delete leaves behind. Read-only;
+            // caches its result via `OwnSleepStore` for the desktop `--audit-own` tooling.
+            Button {
+                auditAppleHealthSleep()
+            } label: {
+                Label("Audit Apple Health sleep", systemImage: "checkmark.seal")
+            }
+            if let sleepAuditResult {
+                Text(sleepAuditResult).font(.caption).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            // Destructive: deletes and re-writes every stored night's sleep in Apple Health so it
+            // matches the stored hypnogram exactly, clearing out whatever a stuck delete left behind
+            // BEFORE the ratchet fix landed. Confirmed before running — see the alert below.
+            Button(role: .destructive) {
+                prepareRebuildAppleHealthSleep()
+            } label: {
+                Label("Rebuild Apple Health sleep", systemImage: "arrow.triangle.2.circlepath")
+            }
+            if let rebuildResult {
+                Text(rebuildResult).font(.caption).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
             Toggle("Capture raw history frames", isOn: $captureEnabled)
             LabeledContent("Frames captured", value: "\(session?.diagnosticsFrameCount ?? 0)")
             if (session?.diagnosticsFrameCount ?? 0) > 0 {
@@ -327,6 +357,26 @@ struct DeviceInfoView: View {
                       allowsMultipleSelection: false) { result in
             repairFromDiagnostics(result)
         }
+        .alert("Rebuild Apple Health sleep?", isPresented: $showRebuildConfirm) {
+            Button("Cancel", role: .cancel) { pendingRebuildNights = [] }
+            Button("Rebuild", role: .destructive) {
+                runRebuildAppleHealthSleep()
+            }
+        } message: {
+            Text(rebuildConfirmMessage)
+        }
+    }
+
+    /// Broken out of the alert's `message:` closure — SwiftUI's result builder couldn't type-check
+    /// the inline string concatenation in reasonable time.
+    private var rebuildConfirmMessage: String {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d"
+        let count = pendingRebuildNights.count
+        let names = pendingRebuildNights.map { f.string(from: $0) }.joined(separator: ", ")
+        return "This deletes and re-writes Apple Health sleep for \(count) "
+            + "night\(count == 1 ? "" : "s") (\(names)) so it matches what OpenCircuit has stored. "
+            + "Only sleep this app wrote is touched — other apps' sleep and your naps are left alone."
     }
 
     /// Merge epoch records recovered from a previously exported diagnostics file back into the
@@ -441,6 +491,141 @@ struct DeviceInfoView: View {
                 externalSleepResult = "Imported \(samples.count) intervals (\(awake) awake) "
                     + "from \(sources), last \(days) days."
             }
+        }
+    }
+
+    /// Every stored night with a non-empty saved hypnogram — the set both the audit and the rebuild
+    /// operate over (#health-sleep-mirror-duplicates). A night with an EMPTY hypnogram (staged before
+    /// the column existed, or never staged) is excluded from both: rebuilding it would delete
+    /// whatever is in Health with nothing correct to write back in its place.
+    private func nightsWithStoredHypnogram(
+        _ local: LocalStore
+    ) -> [(row: StoredSleepSummary, hypnogram: [SleepSegment])] {
+        let farBack = Calendar.current.date(byAdding: .year, value: -2, to: Date()) ?? .distantPast
+        let summaries = (try? local.sleepSummaries(from: farBack, to: Date().addingTimeInterval(86400))) ?? []
+        return summaries.compactMap { row in
+            let hyp = local.hypnogram(night: row.night)
+            return hyp.isEmpty ? nil : (row, hyp)
+        }
+    }
+
+    /// Read OUR OWN sleep back out of Apple Health and compare it, per night, against the stored
+    /// hypnogram — the audit instrument for `docs/PENDING_VALIDATION.md` →
+    /// `sleep-health-mirror-idempotent`. Read-only; the result is cached via `OwnSleepStore` so
+    /// `desktop/sleep_reference_labels.py --audit-own` can read it off a `--pull`.
+    ///
+    /// ⚠️ Same HONEST EMPTY caveat as `importExternalSleep` above: HealthKit never reports read
+    /// authorization, so `health.isEmpty` is ambiguous between "Sleep read access is off for us" and
+    /// "Health genuinely has nothing of ours". Without a special case, that ambiguity would render as
+    /// every night "dirty" and point the user at Rebuild — which deletes real Health data — for a
+    /// read-permission problem Rebuild cannot fix. Handled below by checking `health.isEmpty` BEFORE
+    /// composing the summary, same stance `desktop/sleep_reference_labels.py:audit_own` takes.
+    private func auditAppleHealthSleep() {
+        sleepAuditResult = "Reading…"
+        Task { @MainActor in
+            let local = LocalStore(modelContext)
+            let nights = nightsWithStoredHypnogram(local)
+            guard !nights.isEmpty else {
+                sleepAuditResult = "No stored nights have a saved hypnogram yet."
+                return
+            }
+            // Generous padding: a mirror's cleanup span can be WIDER than the night's own recorded
+            // in-bed window (it unions in the last-mirrored span too), so bucket loosely rather than
+            // miss the very duplicates this is trying to find.
+            let padding: TimeInterval = 4 * 3600
+            guard let earliestStart = nights.map({ $0.row.inBedStart }).min(),
+                  let latestEnd = nights.map({ $0.row.inBedEnd }).max() else { return }
+            let health = await HealthKitWriter().readOwnSleepSamples(
+                from: earliestStart.addingTimeInterval(-padding),
+                to: latestEnd.addingTimeInterval(padding))
+            OwnSleepStore().save(health)
+            let f = DateFormatter(); f.dateFormat = "MMM d"
+            var dirty = 0
+            var lines: [String] = []
+            for (row, hyp) in nights.sorted(by: { $0.row.night < $1.row.night }) {
+                let bucketed = health.filter {
+                    $0.start < row.inBedEnd.addingTimeInterval(padding)
+                        && $0.end > row.inBedStart.addingTimeInterval(-padding)
+                }
+                let result = SleepHealthAudit.compare(night: row.night, health: bucketed, stored: hyp)
+                if result.isClean {
+                    lines.append("\(f.string(from: row.night)): clean (\(result.storedSegmentCount) segments)")
+                } else {
+                    dirty += 1
+                    let versions = result.appVersions.isEmpty ? ""
+                        : " [\(result.appVersions.joined(separator: ", "))]"
+                    lines.append("\(f.string(from: row.night)): Health \(result.healthSampleCount) vs "
+                        + "stored \(result.storedSegmentCount), \(result.overlappingPairs) overlapping "
+                        + "pairs\(versions)")
+                }
+            }
+            let summary: String
+            if health.isEmpty {
+                summary = "Health returned NO OpenCircuit sleep at all across "
+                    + "\(nights.count) night\(nights.count == 1 ? "" : "s") — ambiguous between "
+                    + "\"Sleep read access is off for OpenCircuit\" and \"Health genuinely has none of "
+                    + "our sleep\" (HealthKit never reports read denial). Check Health → Sharing → Apps "
+                    + "→ OpenCircuit before tapping Rebuild.\n"
+            } else if dirty == 0 {
+                summary = "All \(nights.count) night\(nights.count == 1 ? "" : "s") clean.\n"
+            } else {
+                summary = "\(dirty) of \(nights.count) night\(nights.count == 1 ? "" : "s") have "
+                    + "duplicates — tap Rebuild to fix.\n"
+            }
+            sleepAuditResult = summary + lines.joined(separator: "\n")
+        }
+    }
+
+    /// Gather the nights the confirmation alert will name, then show it. The actual rebuild only runs
+    /// once the user taps "Rebuild" — this deletes real Apple Health data, so it never runs on a tap
+    /// alone.
+    private func prepareRebuildAppleHealthSleep() {
+        let local = LocalStore(modelContext)
+        pendingRebuildNights = nightsWithStoredHypnogram(local).map(\.row.night).sorted()
+        guard !pendingRebuildNights.isEmpty else {
+            rebuildResult = "No stored nights have a saved hypnogram to rebuild from."
+            return
+        }
+        showRebuildConfirm = true
+    }
+
+    /// Force every night named in the confirmation alert back to exactly matching Apple Health —
+    /// the one-shot repair for nights the ratchet bug (#health-sleep-mirror-duplicates) already
+    /// polluted before the fix landed. Manually-edited nights are skipped: they're owned by the edit
+    /// reconcile, never overwritten here.
+    private func runRebuildAppleHealthSleep() {
+        let nightsToRebuild = pendingRebuildNights
+        pendingRebuildNights = []
+        rebuildResult = "Rebuilding…"
+        Task { @MainActor in
+            let local = LocalStore(modelContext)
+            let writer = HealthKitWriter()
+            var rebuilt = 0
+            var stillPending = 0
+            var skippedEdited = 0
+            var failed = 0
+            for night in nightsToRebuild {
+                let hyp = local.hypnogram(night: night)
+                guard !hyp.isEmpty else { continue }
+                if (try? local.sleepSummary(night: night))?.isManuallyEdited == true {
+                    skippedEdited += 1
+                    continue
+                }
+                switch await writer.rebuildNightSleep(local: local, night: night, segments: hyp) {
+                case true: rebuilt += 1
+                case false: stillPending += 1   // written correctly; delete-verify will retry next flush
+                case nil: failed += 1
+                }
+            }
+            var msg = "Rebuilt \(rebuilt) night\(rebuilt == 1 ? "" : "s")."
+            if stillPending > 0 {
+                msg += " \(stillPending) written but not yet confirmed clean — will retry automatically."
+            }
+            if skippedEdited > 0 { msg += " Skipped \(skippedEdited) manually-edited night(s)." }
+            if failed > 0 { msg += " \(failed) failed outright — check Sleep sharing is allowed." }
+            rebuildResult = msg
+            // Re-audit so the shown result reflects reality, not just the request.
+            auditAppleHealthSleep()
         }
     }
 

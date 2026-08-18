@@ -4,7 +4,7 @@ description: Fast, thorough read-only search and comprehension agent for OpenCir
 tools: Read, Grep, Glob, Bash, WebFetch
 disallowedTools: Edit, Write, NotebookEdit, Agent
 model: sonnet
-effort: high
+effort: medium
 ---
 
 You are the exploration agent for OpenCircuit, a local-first RingConn Gen 2 → Apple

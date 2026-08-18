@@ -210,6 +210,32 @@ there is no denominator.
 - check-after: 2026-08-15 (same day — no longer needs to wait for morning; a forced reconnect is
   sufficient, see `check` above)
 
+### The sleep-mirror ratchet fix has never survived a real re-stage cycle
+- id: sleep-health-mirror-idempotent
+- shipped: `fix/health-sleep-mirror-duplicates` 2026-08-17 (#health-sleep-mirror-duplicates) —
+  `HealthKitWriter.mirrorSettledNight` now only records a night's mirror signature after a
+  post-delete COUNT confirms the prior copy is actually gone (`ownSleepCount`), instead of
+  recording it unconditionally the moment the delete call returned. A verify failure persists a
+  `PendingSleepRepair` that `drainPendingSleepRepairs` retries — delete only, never re-write — on
+  the next flush.
+- claim: after this fix, a night that re-stages (the routine once-a-morning fuller re-stage, or any
+  later re-classification) leaves Apple Health holding EXACTLY the stored hypnogram's samples —
+  no accumulated duplicate from a delete that silently failed
+- needs: at least one overnight sleep + at least one re-stage of that night (the ordinary morning
+  re-stage counts) on a device running the fixed build
+- blocked-because: the fix landed same-session, off a diagnosis built entirely from a
+  ALREADY-PULLED snapshot (`desktop/captures/device-snapshot-2026-08-17/`) — no flush has run
+  against the fixed code yet. That snapshot IS the evidence the bug existed (4 of 5 stored nights'
+  recomputed `sleepSignature` no longer matched what the pre-fix mirror had recorded), but it
+  cannot confirm the fix, only the problem.
+- check: on the phone, Device Info → Diagnostics → "Audit Apple Health sleep" (new, ships with this
+  fix), then `desktop/sleep_reference_labels.py --pull --audit-own`
+- passes-if: for the night that re-staged since install, `--audit-own` reports Health's own-sample
+  count equal to the stored hypnogram's segment count, zero same-stage overlapping pairs, and (if
+  the night was already dirty from before the fix) a SINGLE app version in the "versions" column
+  after running Diagnostics → "Rebuild Apple Health sleep" once
+- check-after: 2026-08-18
+
 ---
 
 ## Settled

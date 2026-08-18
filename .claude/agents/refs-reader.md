@@ -4,7 +4,7 @@ description: Reads source in refs/ (Gadgetbridge, GarminDB, and other reference 
 tools: Read, Grep, Glob, Bash, WebFetch
 disallowedTools: Edit, Write, NotebookEdit, Agent
 model: sonnet
-effort: high
+effort: medium
 ---
 
 You read reference codebases under `refs/` and report facts. You are the reason
