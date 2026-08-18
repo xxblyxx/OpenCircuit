@@ -189,14 +189,59 @@ public struct SpO2AlertPolicy: Equatable, Sendable {
     /// shape of a hand held in water across both readings — is 1.0 and suppresses. 1 of 3 survives.
     public var maxBadEpochFraction: Double
 
+    /// How close two readings must sit to count as the same on-demand measurement burst.
+    ///
+    /// 🟢 MEASURED (2026-08-18, this wearer's own 6-day export, 1091 SpO2 samples). On-demand
+    /// readings taken back-to-back land 4–18 s apart; the longest such gap in the whole corpus is
+    /// 56.6 s, comfortably below the 300 s sleep-program duty cycle it must never be confused with
+    /// — 60 s clears the measured max with margin and sits ~5× under the tightest legitimate
+    /// cadence. **Zero** such tight gaps (≤ 60 s) occur between 23:00 and 07:00 across the whole
+    /// corpus: bursts are exclusively a daytime on-demand phenomenon, so this window provably
+    /// cannot touch overnight desaturation detection (the OSA channel, #91) — the same trap
+    /// `corroborationWindow` above warns about, avoided by construction rather than by hope.
+    public var burstWindow: TimeInterval
+
+    /// How far a nearby reading may sit ABOVE a candidate before it contradicts it, in percentage
+    /// points. Deliberately checked against `burstWindow`, not `corroborationWindow` — this is
+    /// about two readings taken so close together that a real physiological swing of this size is
+    /// implausible, not about whether they describe "the same event" on a multi-minute timescale.
+    ///
+    /// 🟡 REASONED, not sourced. Set one point above `agreementTolerance = 2` — "readings within 2
+    /// points are the same event" — so a contradiction is strictly stronger evidence than a mere
+    /// disagreement. ⚠️ THIS DEVIATES FROM THE NOOP/Strand CITATION USED ABOVE: that source puts
+    /// conflict at ≥ 5, not ≥ 4. 4 is used here because it is the smallest value strictly above
+    /// this codebase's own agreement bound, not because NOOP supports it specifically. The corpus
+    /// does not sharply determine this either way — 4 and 5 produce IDENTICAL outcomes on every
+    /// logged decision to date — so treat this as fitted on one wearer and worth revisiting.
+    public var burstContradictionDelta: Int
+
+    /// How long a reading may sit unpublished before it is too stale to notify about at all —
+    /// the hard backstop for the phone-was-off case, independent of first-sighting (below).
+    ///
+    /// 🟡 ONE DEVICE. Measured worst-case overnight FIRST-SIGHTING latency (reading device time to
+    /// the pass that first evaluates it) on this wearer's corpus is 6 h 19 m (2026-08-15: reading
+    /// 02:03:56, first decision 08:22:50) — the ring buffers overnight and the phone only evaluates
+    /// after the morning sync. 8 h clears that with ~27 % headroom while still catching the
+    /// pathological case (a stale banner hours after the fact) this constant exists for. Deliberately
+    /// NOT the mechanism that fixes the reported incident — that is first-sighting (below), which
+    /// gates on how long the PHONE has known, not on the reading's raw age, precisely so a genuine
+    /// overnight desaturation that only reaches the phone hours later still gets through.
+    public var maxNotifiableAge: TimeInterval
+
     public init(corroborationWindow: TimeInterval = 2700,
                 agreementTolerance: Int = 2,
                 minCorroboratingReadings: Int = 2,
-                maxBadEpochFraction: Double = 0.5) {
+                maxBadEpochFraction: Double = 0.5,
+                burstWindow: TimeInterval = 60,
+                burstContradictionDelta: Int = 4,
+                maxNotifiableAge: TimeInterval = 8 * 3600) {
         self.corroborationWindow = corroborationWindow
         self.agreementTolerance = agreementTolerance
         self.minCorroboratingReadings = minCorroboratingReadings
         self.maxBadEpochFraction = maxBadEpochFraction
+        self.burstWindow = burstWindow
+        self.burstContradictionDelta = burstContradictionDelta
+        self.maxNotifiableAge = maxNotifiableAge
     }
 
     /// Whether ONE epoch is too compromised to count toward a desaturation.
@@ -226,6 +271,22 @@ public struct SpO2AlertPolicy: Equatable, Sendable {
     public func isBadEpoch(_ evidence: SpO2Evidence) -> Bool {
         evidence.unworn || !evidence.resolvesStillness
     }
+
+    /// Whether a HIGHER reading inside the same measurement burst contradicts `reading`.
+    ///
+    /// SIGNED ON PURPOSE: a nearby LOWER reading is a deepening desaturation, not a contradiction
+    /// — only a nearby higher reading, seconds later, says "the low one was noise". This is what
+    /// catches the reported false positive: a 90 % 17 s from a 98 % in the same on-demand burst.
+    /// Real SpO2 cannot swing that far that fast; two readings that close together disagreeing by
+    /// this much are the same finger, the same few seconds, and different results — a burst
+    /// artifact, not two independent samples of the same event.
+    public func isContradicted(_ reading: SpO2Reading, by others: [SpO2Reading]) -> Bool {
+        others.contains {
+            $0.time != reading.time
+                && abs($0.time.timeIntervalSince(reading.time)) <= burstWindow
+                && $0.percent - reading.percent >= burstContradictionDelta
+        }
+    }
 }
 
 /// The outcome of the low-SpO2 rule, carrying enough context for the health-alert log to say WHY.
@@ -249,6 +310,22 @@ public struct SpO2Verdict: Equatable, Sendable {
         /// Corroborated, but more than `maxBadEpochFraction` of the resolved epochs were moving
         /// or unworn.
         case badEpochMajority
+        /// EVERY crossing in the window is contradicted by a higher reading seconds away in the
+        /// same on-demand burst — see `SpO2AlertPolicy.isContradicted`. Distinct from
+        /// `noCorroboration`/`corroborationDisagrees`: those describe a lone crossing with nothing
+        /// (or nothing agreeing) nearby; this describes a crossing the ring's OWN neighbouring
+        /// reading actively refutes.
+        case burstArtifact
+        /// EVERY otherwise-eligible crossing is older than `SpO2AlertPolicy.maxNotifiableAge` — the
+        /// hard backstop for the phone having been off for a long stretch.
+        case tooOld
+        /// EVERY otherwise-eligible crossing has already been evaluated by an earlier pass — see
+        /// the first-sighting ledger in `HealthNotificationStore` (app target). A trigger only ever
+        /// gets ONE chance to fire, on the first pass that considers it; this is what stops a
+        /// reading suppressed all morning from becoming the surviving worst-first trigger many
+        /// hours later purely because an earlier candidate aged out of the lookback window — the
+        /// exact mechanism behind the reported 12h-late notification.
+        case alreadySeen
     }
 
     public let outcome: Outcome
@@ -386,15 +463,67 @@ public enum HealthAlertEvaluator {
     /// candidate's own verdict is returned, matching the prior single-trigger behaviour exactly —
     /// so this only changes the outcome when the worst reading fails and a LESS severe one would
     /// have fired, which is precisely the masking case.
+    /// `alreadyConsidered` is the first-sighting ledger (D3): reading times some EARLIER pass has
+    /// already evaluated, regardless of what it decided. `now`, when supplied, enforces
+    /// `policy.maxNotifiableAge` — the hard backstop for a reading that arrives very stale. Both
+    /// default to "off" (`[]` / `nil`) so every existing caller — including every test written
+    /// before D3 — keeps its exact prior behaviour.
     public static func lowSpO2(_ readings: [SpO2Reading],
                                thresholdPercent: Int,
                                notBefore: Date = .distantPast,
+                               alreadyConsidered: Set<Date> = [],
+                               now: Date? = nil,
                                policy: SpO2AlertPolicy = SpO2AlertPolicy()) -> SpO2Verdict {
-        let candidates = readings.filter {
+        // Computed ONCE over the full series, not per candidate — `evaluateOne` runs in a
+        // worst-first loop below and this is O(n²); a single pre-pass keeps it O(n²) total instead
+        // of O(n³). n is bounded by the 12 h lookback (a few hundred readings at most).
+        let contradicted = Set(readings.filter { policy.isContradicted($0, by: readings) }.map(\.time))
+        // Whole-second keys: `alreadyConsidered` crosses a UserDefaults round-trip in the app layer
+        // (Date → Double → Date), and comparing raw `Date` equality across that boundary is the kind
+        // of float hazard this codebase already avoids elsewhere — see
+        // `HealthNotificationCenter.deduplicatedByTime`, which keys the same SpO2 series the same way.
+        let consideredSeconds = Set(alreadyConsidered.map { Int($0.timeIntervalSince1970.rounded()) })
+
+        let allCandidates = readings.filter {
             $0.percent > 0 && $0.percent <= thresholdPercent && $0.time > notBefore
         }
-        guard !candidates.isEmpty else {
+        guard !allCandidates.isEmpty else {
             return SpO2Verdict(outcome: .noCandidate, reading: nil, runSize: 0,
+                               nearestNeighbourDelta: nil, evidenceEpochs: 0, badEpochs: 0)
+        }
+        func worst(of pool: [SpO2Reading]) -> SpO2Reading {
+            pool.sorted(by: { ($0.percent, $0.time) < ($1.percent, $1.time) })[0]
+        }
+
+        // Burst artifacts are excluded as TRIGGERS entirely — they cannot be evaluated, only
+        // reported as rejected. If something legitimate remains, it gets its normal turn below.
+        let notArtifact = allCandidates.filter { !contradicted.contains($0.time) }
+        guard !notArtifact.isEmpty else {
+            // Every crossing in the window was contradicted by a burst neighbour. Report the worst
+            // one so the log can name it, same tie-break as the ordinary path below.
+            return SpO2Verdict(outcome: .burstArtifact, reading: worst(of: allCandidates), runSize: 0,
+                               nearestNeighbourDelta: nil, evidenceEpochs: 0, badEpochs: 0)
+        }
+
+        // The age backstop, applied only when the caller supplies `now` — skipped entirely
+        // otherwise, which is what keeps every pre-D3 test byte-identical.
+        let notTooOld: [SpO2Reading]
+        if let now {
+            notTooOld = notArtifact.filter { now.timeIntervalSince($0.time) <= policy.maxNotifiableAge }
+        } else {
+            notTooOld = notArtifact
+        }
+        guard !notTooOld.isEmpty else {
+            return SpO2Verdict(outcome: .tooOld, reading: worst(of: notArtifact), runSize: 0,
+                               nearestNeighbourDelta: nil, evidenceEpochs: 0, badEpochs: 0)
+        }
+
+        // First-sighting: a reading already evaluated by an earlier pass does not get a second turn
+        // as a TRIGGER — it remains fully eligible as a CORROBORATOR below (`evaluateOne` does not
+        // filter on this set), so a late-arriving partner can still complete a genuine run.
+        let candidates = notTooOld.filter { !consideredSeconds.contains(Int($0.time.timeIntervalSince1970.rounded())) }
+        guard !candidates.isEmpty else {
+            return SpO2Verdict(outcome: .alreadySeen, reading: worst(of: notTooOld), runSize: 0,
                                nearestNeighbourDelta: nil, evidenceEpochs: 0, badEpochs: 0)
         }
 
@@ -405,7 +534,7 @@ public enum HealthAlertEvaluator {
         // `readingTime`, which is part of the decision log's dedupe key — differ pass to pass on
         // identical data, re-logging the same suppression and evicting real history.
         for trigger in candidates.sorted(by: { ($0.percent, $0.time) < ($1.percent, $1.time) }) {
-            let verdict = evaluateOne(trigger, readings: readings,
+            let verdict = evaluateOne(trigger, readings: readings, contradicted: contradicted,
                                       thresholdPercent: thresholdPercent, policy: policy)
             if verdict.fired { return verdict }
             if worstVerdict == nil { worstVerdict = verdict }
@@ -417,18 +546,26 @@ public enum HealthAlertEvaluator {
 
     /// The corroboration + evidence check for ONE candidate trigger. Pulled out of `lowSpO2` so
     /// that function can try every candidate worst-first without duplicating this logic.
+    ///
+    /// `contradicted` is the burst-artifact set computed once by the caller over the full series.
     private static func evaluateOne(_ trigger: SpO2Reading, readings: [SpO2Reading],
+                                    contradicted: Set<Date>,
                                     thresholdPercent: Int, policy: SpO2AlertPolicy) -> SpO2Verdict {
         let neighbours = readings.filter {
             $0.time != trigger.time
                 && abs($0.time.timeIntervalSince(trigger.time)) <= policy.corroborationWindow
         }
+        // `nearestNeighbourDelta` stays over the FULL neighbour set (artifacts included) — it is
+        // diagnostic, and more informative unfiltered.
         let nearestDelta = neighbours
             .min { abs($0.time.timeIntervalSince(trigger.time)) < abs($1.time.timeIntervalSince(trigger.time)) }
             .map { abs($0.percent - trigger.percent) }
 
+        // A burst artifact cannot corroborate — it is exactly the kind of reading the corroboration
+        // rule exists to see through, so letting it stand in as support would reopen the defect.
         let corroborators = neighbours.filter {
-            $0.percent <= thresholdPercent && abs($0.percent - trigger.percent) <= policy.agreementTolerance
+            !contradicted.contains($0.time)
+                && $0.percent <= thresholdPercent && abs($0.percent - trigger.percent) <= policy.agreementTolerance
         }
         let run = [trigger] + corroborators
         guard run.count >= policy.minCorroboratingReadings else {
@@ -442,7 +579,13 @@ public enum HealthAlertEvaluator {
             // disagree — there is simply nothing to corroborate it. Reporting that as
             // `.corroborationDisagrees` puts normal readings into the population someone would
             // later mine to tune `agreementTolerance`, which they have nothing to do with.
-            let lowNeighbours = neighbours.filter { $0.percent <= thresholdPercent }
+            //
+            // This must read the ARTIFACT-FILTERED low neighbours, not the full set: a run whose
+            // only low neighbour was itself a rejected burst artifact has nothing LEGITIMATE
+            // nearby, and that is `.noCorroboration` — reporting `.corroborationDisagrees` here
+            // would be misleading AND would churn the decision log's `(readingTime, reason)`
+            // dedupe key every time a formerly-uncontradicted neighbour becomes contradicted.
+            let lowNeighbours = neighbours.filter { !contradicted.contains($0.time) && $0.percent <= thresholdPercent }
             return SpO2Verdict(outcome: lowNeighbours.isEmpty ? .noCorroboration : .corroborationDisagrees,
                                reading: trigger, runSize: run.count,
                                nearestNeighbourDelta: nearestDelta,
@@ -554,10 +697,16 @@ public enum HealthAlertEvaluator {
 
     /// Evaluate all three #73 rules and return the hits (disabled rules are skipped). `inactiveHR`
     /// is the HR series for the sustained-while-inactive rule; the instantaneous rules use `hr`.
+    ///
+    /// `spo2AlreadyConsidered` / `spo2Now` are D3's first-sighting ledger + age backstop, forwarded
+    /// to `lowSpO2` unchanged. Both default to "off" so every caller that predates D3 — including
+    /// every existing test — is unaffected.
     public static func evaluate(hr: [HRSample], spo2: [SpO2Reading], inactiveHR: [HRSample],
                                 thresholds: HealthAlertThresholds,
                                 lastFired: [HealthNotification: Date] = [:],
-                                spo2Policy: SpO2AlertPolicy = SpO2AlertPolicy()) -> HealthAlertOutcome {
+                                spo2Policy: SpO2AlertPolicy = SpO2AlertPolicy(),
+                                spo2AlreadyConsidered: Set<Date> = [],
+                                spo2Now: Date? = nil) -> HealthAlertOutcome {
         var hits: [HealthAlertHit] = []
         let freshHR = hr.filter { $0.start > (lastFired[.highHR] ?? .distantPast) }
         let freshInactiveHR = inactiveHR.filter {
@@ -576,6 +725,8 @@ public enum HealthAlertEvaluator {
         if thresholds.lowSpO2Enabled {
             spo2Verdict = lowSpO2(spo2, thresholdPercent: thresholds.lowSpO2Percent,
                                   notBefore: lastFired[.lowSpO2] ?? .distantPast,
+                                  alreadyConsidered: spo2AlreadyConsidered,
+                                  now: spo2Now,
                                   policy: spo2Policy)
             if spo2Verdict.fired, let s = spo2Verdict.reading {
                 hits.append(HealthAlertHit(notification: .lowSpO2, value: Double(s.percent), time: s.time))

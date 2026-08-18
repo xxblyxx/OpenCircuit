@@ -161,6 +161,40 @@ struct HealthNotificationStore {
         for n in notifs { raw[n.rawValue] = night }
         defaults.set(raw, forKey: Self.nightKey)
     }
+
+    // MARK: First-sighting ledger for low-SpO2 (D3 — the 12h-late-notification fix)
+    //
+    // A 2026-08-17 incident posted "Low blood oxygen" at 20:42 about an 08:45 reading — the trigger
+    // simply ROTATED as earlier candidates aged out of the 12h `instantLookback` window, so the same
+    // event kept re-entering evaluation all day. `lastFired`/`notBefore` cannot prevent this: it is
+    // only written once a verdict actually FIRES, so a reading that was SUPPRESSED all morning (e.g.
+    // `noCorroboration`) is never watermarked and stays a live candidate for the full 12h.
+    //
+    // This ledger tracks every SpO2 reading time already EVALUATED by some earlier pass, independent
+    // of what that pass decided. A fired verdict may only post if its trigger has never been seen
+    // before — i.e. it fires on the FIRST pass that ever considers it, not on whichever pass the
+    // worst-first search happens to route through. Whole-second epoch keys, `[Double]` in
+    // UserDefaults — mirrors the rounding `HealthNotificationCenter.deduplicatedByTime` already uses
+    // for this same series, so a value round-tripped through storage still matches.
+    private static let consideredSpO2Key = "alerts.lowSpO2.consideredReadings"
+
+    /// `nil` = the ledger has never been written (cold start / first launch after this fix). The
+    /// caller treats that as "everything in view is unseen", seeds the ledger, and posts nothing —
+    /// an upgrade must never surface a stale banner for a reading that predates it.
+    func consideredSpO2Readings() -> Set<Date>? {
+        guard let raw = defaults.array(forKey: Self.consideredSpO2Key) as? [Double] else { return nil }
+        return Set(raw.map { Date(timeIntervalSince1970: $0) })
+    }
+
+    /// Insert `times` into the considered-SpO2 ledger and prune anything older than `prune` (the
+    /// caller's `instantSince`), so the persisted set never outgrows the alert lookback it tracks.
+    func markConsideredSpO2(_ times: [Date], prune: Date) {
+        guard !times.isEmpty else { return }
+        var set = Set((defaults.array(forKey: Self.consideredSpO2Key) as? [Double]) ?? [])
+        for t in times { set.insert(t.timeIntervalSince1970) }
+        let bound = prune.timeIntervalSince1970
+        defaults.set(set.filter { $0 >= bound }.sorted(), forKey: Self.consideredSpO2Key)
+    }
 }
 
 // MARK: - The engine
@@ -281,13 +315,31 @@ struct HealthNotificationCenter {
         let stepIntervals = HealthAlertEvaluator.activeStepIntervals(stepWindows)
         let nonExercisingHR = HealthAlertEvaluator.nonExercising(hr, activeIntervals: stepIntervals)
 
+        // --- D3: first-sighting ledger for low-SpO2 --------------------------------------------
+        // Fixes the reported 12h-late notification: `lastFired`/`notBefore` alone only watermark a
+        // reading once its verdict actually FIRES, so a reading suppressed all morning (e.g.
+        // `noCorroboration`) stays a live candidate for the full 12h lookback and can silently
+        // become the surviving worst-first trigger many hours later, purely because an earlier
+        // candidate aged out of the window. See `HealthNotificationStore`'s doc comment.
+        //
+        // `nil` from the store means the ledger has never been written (cold start / first launch
+        // after this fix) — seed it with EVERY reading currently in view so nothing can fire this
+        // pass. An upgrade must never surface a stale banner for a reading that predates it.
+        let priorConsidered: Set<Date>? = thresholds.lowSpO2Enabled ? store.consideredSpO2Readings() : nil
+        let coldStart = thresholds.lowSpO2Enabled && priorConsidered == nil
+        let spo2AlreadyConsidered: Set<Date> = thresholds.lowSpO2Enabled
+            ? (coldStart ? Set(spo2.map(\.time)) : (priorConsidered ?? []))
+            : []
+
         // Both the instantaneous high-HR and the sustained-while-inactive rule read the non-exercising
         // series over the same wide window; the evaluator's own `lastFired` filter gives once-per-event
         // de-dupe. SpO2 (`spo2`) is passed unfiltered — its rule is unaffected by the activity gate.
         let outcome = HealthAlertEvaluator.evaluate(hr: nonExercisingHR, spo2: spo2,
                                                     inactiveHR: nonExercisingHR,
                                                     thresholds: thresholds,
-                                                    lastFired: lastFired)
+                                                    lastFired: lastFired,
+                                                    spo2AlreadyConsidered: spo2AlreadyConsidered,
+                                                    spo2Now: now)
         for hit in outcome.hits {
             candidates.append(hit.notification)
             hitByNotif[hit.notification] = hit
@@ -298,6 +350,18 @@ struct HealthNotificationCenter {
         // things that became candidates.
         if outcome.spo2.outcome != .noCandidate && !outcome.spo2.fired {
             Self.recordSuppressedSpO2(outcome.spo2, now: now)
+        }
+
+        // Persist the ledger EARLY — before any gate/auth outcome is known — except the trigger of
+        // a verdict that FIRED this pass. That one is inserted separately, later, ONLY once delivery
+        // is actually confirmed (search for `spo2FiredTrigger` below): if the shared gate holds it
+        // (quiet hours / backoff) or authorization is denied, the trigger must stay retriable —
+        // exactly the same self-healing behaviour every other suppression reason already has via
+        // `lastFired`/`notBefore`. Everything else in view is unconditionally "considered" now,
+        // whether or not it played any part in this pass's verdict.
+        let spo2FiredTrigger: Date? = outcome.spo2.fired ? outcome.spo2.reading?.time : nil
+        if thresholds.lowSpO2Enabled {
+            store.markConsideredSpO2(spo2.map(\.time).filter { $0 != spo2FiredTrigger }, prune: instantSince)
         }
 
         // Read the per-night / per-day ledger ONCE. The #85 temp family and the #183 morning verdict
@@ -369,6 +433,12 @@ struct HealthNotificationCenter {
         // real fever/skin-temp flag for the whole day if auth was denied and nothing was posted.
         store.markFired(fire, at: now)
         guard await ensureAuthorized() else { return }
+        // Confirm delivery of the SpO2 trigger — see the ledger write above for why this is
+        // deferred until now: a denied authorization must leave the trigger retriable, the same
+        // self-healing behaviour every other suppression path already gets from `lastFired`.
+        if let spo2FiredTrigger, fire.contains(.lowSpO2) {
+            store.markConsideredSpO2([spo2FiredTrigger], prune: instantSince)
+        }
         if let tempNightKey { store.markNight(fire.filter(Self.isTempFever), night: tempNightKey) }
         // Same deferral, same reason (#183): the day ledger only re-arms on a strictly NEWER day, so
         // claiming today before a successful post would swallow this morning's verdict for the whole
@@ -387,7 +457,7 @@ struct HealthNotificationCenter {
             // exactly, so a recomputed key would silently mark nothing.
             if let headacheRowDay { try? localStore.markRiskAlerted(day: headacheRowDay) }
         }
-        for n in fire { await post(n, hit: hitByNotif[n], signals: headacheSignals) }
+        for n in fire { await post(n, hit: hitByNotif[n], signals: headacheSignals, now: now) }
     }
 
     /// First-wins de-duplication on whole-second device time, preserving input order.
@@ -863,9 +933,9 @@ struct HealthNotificationCenter {
     }
 
     private func post(_ n: HealthNotification, hit: HealthAlertHit?,
-                      signals: [HeadacheSignals.Feature] = []) async {
+                      signals: [HeadacheSignals.Feature] = [], now: Date = Date()) async {
         let content = UNMutableNotificationContent()
-        let copy = Self.copy(for: n, hit: hit, signals: signals)
+        let copy = Self.copy(for: n, hit: hit, signals: signals, now: now)
         content.title = copy.title
         content.body = Self.appendsDisclaimer(n) ? copy.body + "\n\n" + Self.disclaimer : copy.body
         content.sound = .default
@@ -889,30 +959,50 @@ struct HealthNotificationCenter {
         "Note: OpenCircuit is not a medical device. These reminders are based on ring sensor "
         + "data only and are not a diagnosis. If you feel unwell, consult a qualified medical professional."
 
-    private static func timeString(_ date: Date?) -> String {
+    /// Hoisted per the file's own established pattern (see `ActivityLogView.alertReadingTimeFormatter`)
+    /// — `DateFormatter` init is expensive enough to be worth doing once, not per notification.
+    private static let shortTimeFormatter: DateFormatter = { let f = DateFormatter(); f.timeStyle = .short; return f }()
+    private static let dayAndTimeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short; return f
+    }()
+
+    /// A full connector phrase ("at 8:45 AM" / "yesterday at 10:15 PM" / "on Aug 14 at 5:56 AM"),
+    /// not just a bare clock time. D3 lets a genuinely fresh reading post many hours after it was
+    /// taken (a slow overnight arrival, or the `maxNotifiableAge` backstop's own margin) — a bare
+    /// "at 8:45 AM" on a notification that lands at 9pm reads as LIVE. Same-day is unchanged, so
+    /// the overwhelmingly common instantaneous case reads exactly as it always has.
+    private static func timeString(_ date: Date?, now: Date, calendar: Calendar = .current) -> String {
         guard let date else { return "" }
-        let f = DateFormatter(); f.timeStyle = .short
-        return f.string(from: date)
+        if calendar.isDate(date, inSameDayAs: now) {
+            return "at " + shortTimeFormatter.string(from: date)
+        }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+           calendar.isDate(date, inSameDayAs: yesterday) {
+            return "yesterday at " + shortTimeFormatter.string(from: date)
+        }
+        return "on " + dayAndTimeFormatter.string(from: date)
     }
 
     /// `signals` is used only by `.headacheSigns` — the ring-derived features that drifted furthest,
-    /// already ranked. Defaulted so every other call site (and `HealthAlertCopyTests`) is unchanged.
+    /// already ranked. `now` anchors the date-aware `timeString` above; defaulted to `Date()` so
+    /// every existing call site (including `HealthAlertCopyTests`, which constructs `hit.time` as
+    /// `Date()` moments earlier) is unaffected. Defaulted so every other call site is unchanged.
     static func copy(for n: HealthNotification, hit: HealthAlertHit?,
-                     signals: [HeadacheSignals.Feature] = []) -> (title: String, body: String) {
-        let at = timeString(hit?.time)
+                     signals: [HeadacheSignals.Feature] = [], now: Date = Date()) -> (title: String, body: String) {
+        let at = timeString(hit?.time, now: now)
         switch n {
         case .highHR:
             let bpm = hit.map { Int($0.value) }
             return ("High heart rate",
                     "High heart rate detected"
                     + (bpm.map { " (\($0) bpm)" } ?? "")
-                    + (at.isEmpty ? "" : " at \(at)") + ".")
+                    + (at.isEmpty ? "" : " \(at)") + ".")
         case .lowSpO2:
             let pct = hit.map { Int($0.value) }
             return ("Low blood oxygen",
                     "Low blood oxygen detected"
                     + (pct.map { " (\($0)%)" } ?? "")
-                    + (at.isEmpty ? "" : " at \(at)") + " (estimate).")
+                    + (at.isEmpty ? "" : " \(at)") + " (estimate).")
         case .elevatedHRInactive:
             // Cite the user's CONFIGURED threshold, not the completing sample's bpm. `hit.value` here is
             // the reading that finished the 10-min run (HealthAlerts elevatedHRInactive), NOT the peak

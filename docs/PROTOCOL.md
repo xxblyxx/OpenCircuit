@@ -845,6 +845,14 @@ drains **both** every sync; we had hardcoded `0x00`, so we missed everything `0x
   cover "the daytime SpO₂ gap" — e.g. `HealthAlerts.swift`'s `SpO2AlertPolicy
   .corroborationWindow` — off the ~10 min headline alone; it undershoots the tail by roughly
   4×. n=31 from a single ring is not a lot — worth re-measuring as more exports accumulate.
+  🟢 MEASURED separately (2026-08-18, `device_alert_audit.py --pull`, this wearer's own 6-day
+  export, 1091 SpO2-carrying samples): **on-demand SpO2 readings arrive in tight back-to-back
+  pairs**, 4–18 s apart, distinct from both the ~300 s sleep-program cadence and this ~10 min+
+  daytime cadence — 100 of 1090 inter-sample gaps sit ≤ 60 s, longest 56.6 s, and **zero** occur
+  between 23:00 and 07:00 across the whole corpus. Load-bearing for
+  `SpO2AlertPolicy.burstWindow` (`HealthAlerts.swift`, #spo2-burst-fix, `docs/HEALTH_ALERTS_SPO2.md`
+  §2) — the reported false positive paired two readings from different bursts, each 17 s from a
+  healthy neighbour it ignored.
 
 So all-day SpO₂ was on the wire all along — in channel `0x03`, which our `0x00`-only syncs never
 requested. That is the whole cause of "daytime SpO₂ stale for hours" while overnight SpO₂ and on-demand

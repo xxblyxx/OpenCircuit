@@ -237,11 +237,188 @@ final class HealthAlertsTests: XCTestCase {
                        .noCandidate)
     }
 
+    // MARK: burst-artifact rejection (D1 — the 2026-08-17 false positive)
+    //
+    // The reported false positive: a 90% reading 17s from a 98% in the same on-demand
+    // measurement burst, paired with ANOTHER 90% 17s from its own 98% neighbour eight minutes
+    // later. `evaluateOne` only ever inspected LOW neighbours when corroborating, so the two 90s
+    // "corroborated" each other while the healthy readings seconds away — the ones that actually
+    // refute each of them — were invisible to the check. See `SpO2AlertPolicy.isContradicted`.
+
+    /// A `SpO2Reading` at second-level precision — burst windows are 60s wide, which minute
+    /// granularity can't express. Kept local to this section; `spo2`/`at` above stay
+    /// minute-level for every other test so no existing call site is touched.
+    private func spo2Sec(_ percent: Int, _ h: Int, _ m: Int, _ s: Int,
+                         _ evidence: SpO2Evidence? = nil) -> SpO2Reading {
+        SpO2Reading(percent: percent,
+                   time: cal.date(from: DateComponents(year: 2026, month: 6, day: 17,
+                                                        hour: h, minute: m, second: s))!,
+                   evidence: evidence)
+    }
+
+    /// ⚠️ REGRESSION PIN, verbatim from the device. Pulled via `desktop/device_alert_audit.py
+    /// --pull` from the phone that produced the reported "Low blood oxygen (90%)" notification at
+    /// 20:42 about an 08:45 reading. `device_alert_audit.py`'s own Python mirror re-derives the
+    /// SAME outcome against the real snapshot — this is the same series in Swift.
+    func testTheReportedIncidentDoesNotFire() {
+        let r = [
+            spo2Sec(97, 8, 17, 55), spo2Sec(90, 8, 18, 11), spo2Sec(83, 8, 22, 41),
+            spo2Sec(97, 8, 22, 59), spo2Sec(99, 8, 39, 0), spo2Sec(90, 8, 45, 51),
+            spo2Sec(98, 8, 46, 8), spo2Sec(98, 8, 54, 35), spo2Sec(90, 8, 54, 52),
+            spo2Sec(94, 9, 5, 36), spo2Sec(89, 9, 42, 17),
+        ]
+        let v = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)
+        XCTAssertNotEqual(v.outcome, .fired, "every crossing in this window is a burst artifact")
+    }
+
+    /// The OSA/overnight channel (#91) must survive the burst rule untouched: two sub-threshold
+    /// readings at the sleep-program cadence (300s apart), nothing tight nearby. Guards the same
+    /// "fix the false alarm by deleting the channel it came from" trap `corroborationWindow`'s
+    /// doc comment already warns about, specifically for the new burst-window constant — MEASURED
+    /// zero tight (≤60s) gaps between 23:00 and 07:00 across the whole corpus is why 60s is safe.
+    func testSleepCadenceCorroborationSurvivesTheBurstRule() {
+        let r = [spo2Sec(88, 3, 0, 0, quietEpoch), spo2Sec(86, 3, 5, 0, quietEpoch)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90).outcome, .fired)
+    }
+
+    /// SIGNED on purpose: a LOWER reading nearby never contradicts. 85 (nearby, lower) gets
+    /// excluded in its OWN right here — it sits within `burstWindow` of a HIGHER 90, so 85, not
+    /// 90, is the one a higher neighbour refutes — but 90 itself must stay untouched: evaluated
+    /// as an ordinary candidate, reported `.noCorroboration` (its only nearby low reading was
+    /// excluded), never `.burstArtifact`. If the sign were dropped, 90 would ALSO see 85 as
+    /// "contradicting" it and both would wrongly reject.
+    func testLowerNearbyReadingIsNotAContradiction() {
+        let r = [spo2Sec(90, 8, 0, 0, quietEpoch), spo2Sec(85, 8, 0, 20, quietEpoch)]
+        let v = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)
+        XCTAssertEqual(v.outcome, .noCorroboration, "90 survives as an ordinary candidate, not an artifact")
+        XCTAssertEqual(v.reading?.percent, 90, "the LOWER reading (85) is what got excluded, not the trigger")
+    }
+
+    /// A rejected burst artifact must not stand in as a CORROBORATOR either — only as a trigger.
+    /// An isolated, clean 90% crossing whose sole nearby low reading (88%) is itself contradicted
+    /// by a 98% ten seconds later ends up with nothing legitimate to corroborate it.
+    func testArtifactsCannotCorroborate() {
+        let r = [
+            spo2Sec(90, 8, 0, 0, quietEpoch),   // isolated, clean trigger
+            spo2Sec(88, 8, 5, 0, quietEpoch),   // would-be corroborator...
+            spo2Sec(98, 8, 5, 10, quietEpoch),  // ...but this makes IT a burst artifact
+        ]
+        let v = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90)
+        XCTAssertEqual(v.outcome, .noCorroboration)
+        XCTAssertEqual(v.reading?.percent, 90)
+    }
+
+    /// Boundaries, both dimensions. `burstContradictionDelta` (4) and `burstWindow` (60s) are
+    /// both fitted to a single wearer's corpus (see the doc comments on `SpO2AlertPolicy`) —
+    /// pinning the exact edges is what would catch a future re-fit silently drifting the
+    /// direction of either inequality.
+    func testBurstContradictionBoundaries() {
+        // Δ=3 is below burstContradictionDelta — not a contradiction.
+        let deltaUnder = [spo2Sec(90, 8, 0, 0, quietEpoch), spo2Sec(93, 8, 0, 20, quietEpoch)]
+        XCTAssertNotEqual(HealthAlertEvaluator.lowSpO2(deltaUnder, thresholdPercent: 90).outcome,
+                          .burstArtifact)
+        // Δ=4 meets burstContradictionDelta exactly — contradicted.
+        let deltaAtBound = [spo2Sec(90, 8, 0, 0, quietEpoch), spo2Sec(94, 8, 0, 20, quietEpoch)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(deltaAtBound, thresholdPercent: 90).outcome,
+                       .burstArtifact)
+        // 60s is AT burstWindow — the comparison is `<=`, so it still counts.
+        let windowAtBound = [spo2Sec(90, 8, 0, 0, quietEpoch), spo2Sec(98, 8, 1, 0, quietEpoch)]
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(windowAtBound, thresholdPercent: 90).outcome,
+                       .burstArtifact)
+        // 61s is one second past the window — not a contradiction.
+        let windowPastBound = [spo2Sec(90, 8, 0, 0, quietEpoch), spo2Sec(98, 8, 1, 1, quietEpoch)]
+        XCTAssertNotEqual(HealthAlertEvaluator.lowSpO2(windowPastBound, thresholdPercent: 90).outcome,
+                          .burstArtifact)
+    }
+
+    // MARK: first-sighting ledger + age backstop (D3 — the 12h-late notification)
+    //
+    // A reading suppressed on its first pass (e.g. `.noCorroboration`) stays a live candidate for
+    // the full 12h lookback, because `lastFired`/`notBefore` only watermark a reading once its
+    // verdict actually FIRES. Without a first-sighting gate the trigger can silently ROTATE onto
+    // a much later pass purely because an earlier candidate aged out of the window — the exact
+    // mechanism behind the reported 12h-late notification. `alreadyConsidered` is the KIT half of
+    // that fix; `HealthNotificationStore` (app target) is what actually persists it pass to pass.
+
+    func testFirstSightingFiresOnceThenAlreadySeenOnTheNextPass() {
+        let r = [spo2(88, 3, 0, quietEpoch), spo2(89, 3, 5, quietEpoch)]
+        let first = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, alreadyConsidered: [])
+        XCTAssertEqual(first.outcome, .fired)
+        XCTAssertEqual(first.reading?.percent, 88)
+
+        // Simulate the app's ledger after pass 1: every reading in view is now "considered".
+        let considered = Set(r.map(\.time))
+        let second = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, alreadyConsidered: considered)
+        XCTAssertEqual(second.outcome, .alreadySeen)
+        XCTAssertEqual(second.reading?.percent, 88, "names the same trigger it already saw")
+    }
+
+    /// A reading that arrived alone and could not corroborate must not permanently block the
+    /// EVENT it belongs to: once a genuine corroborator arrives fresh on a later pass, that
+    /// corroborator — not the already-seen reading — becomes the trigger, and the run still
+    /// fires. This is what keeps first-sighting from swallowing a slow-arriving overnight pair.
+    func testLateCorroboratorStillAlertsViaTheNewlySeenPartner() {
+        let a = spo2(90, 2, 0, quietEpoch)
+        let firstPass = HealthAlertEvaluator.lowSpO2([a], thresholdPercent: 90)
+        XCTAssertEqual(firstPass.outcome, .noCorroboration)
+
+        let considered: Set<Date> = [a.time]
+        let b = spo2(89, 2, 20, quietEpoch)   // arrives fresh on a later pass
+        let secondPass = HealthAlertEvaluator.lowSpO2([a, b], thresholdPercent: 90,
+                                                       alreadyConsidered: considered)
+        XCTAssertEqual(secondPass.outcome, .fired)
+        XCTAssertEqual(secondPass.reading?.percent, 89, "B is fresh and triggers; A only corroborates")
+    }
+
+    /// Cold start (app-layer semantics, pinned at the Kit level): "ledger never written" is
+    /// treated as "everything currently in view is already considered", so an upgrade cannot
+    /// surface a stale banner for a reading that predates the fix.
+    func testColdStartSeedsWithoutFiring() {
+        let r = [spo2(88, 3, 0, quietEpoch), spo2(89, 3, 5, quietEpoch)]
+        let warm = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, alreadyConsidered: [])
+        XCTAssertEqual(warm.outcome, .fired, "sanity check: this series fires with an empty ledger")
+
+        let coldStart = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90,
+                                                      alreadyConsidered: Set(r.map(\.time)))
+        XCTAssertEqual(coldStart.outcome, .alreadySeen, "seeded, not posted")
+    }
+
+    /// The hard backstop for the phone-was-off case: even on its FIRST sighting, a reading older
+    /// than `maxNotifiableAge` must not post. Independent of first-sighting — `now` alone decides.
+    func testAgeBackstopBlocksAVeryStaleFirstSighting() {
+        let r = [spo2(88, 3, 0, quietEpoch), spo2(89, 3, 5, quietEpoch)]
+        let withinBackstop = cal.date(byAdding: .hour, value: 1, to: at(3, 5))!
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, now: withinBackstop).outcome,
+                       .fired, "well within maxNotifiableAge — fires normally")
+
+        let tooLate = cal.date(byAdding: .hour, value: 9, to: at(3, 5))!
+        XCTAssertEqual(HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, now: tooLate).outcome,
+                       .tooOld)
+    }
+
+    /// Pins the CONTRACT the app-layer's self-healing retry depends on:
+    /// `HealthNotificationCenter` only inserts a fired trigger into the considered-set AFTER
+    /// confirming delivery — if the shared quiet-hours/backoff gate holds a fired verdict, or
+    /// authorization is denied, the trigger is deliberately NOT inserted, so it must remain fully
+    /// eligible on a later pass over the same data, exactly like every other suppression reason
+    /// already gets from `lastFired`/`notBefore`.
+    func testATriggerNotYetConsideredCanStillFireOnARepeatedPass() {
+        let r = [spo2(88, 3, 0, quietEpoch), spo2(89, 3, 5, quietEpoch)]
+        let firstPass = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, alreadyConsidered: [])
+        XCTAssertEqual(firstPass.outcome, .fired)
+
+        // The gate held it, so the app never inserted the trigger. A later pass over identical
+        // data (nothing new synced) must still fire, exactly as if this were the first sighting.
+        let heldByGate = HealthAlertEvaluator.lowSpO2(r, thresholdPercent: 90, alreadyConsidered: [])
+        XCTAssertEqual(heldByGate.outcome, .fired, "not yet considered — still eligible")
+    }
+
     func testEveryNonFiringOutcomeIsNameableForTheLog() {
         // The log writes `outcome.rawValue` as its reason, so a case with no distinct value would
         // silently collapse two different decisions into one indistinguishable row.
         let all: [SpO2Verdict.Outcome] = [.fired, .noCandidate, .noCorroboration,
-                                          .corroborationDisagrees, .badEpochMajority]
+                                          .corroborationDisagrees, .badEpochMajority,
+                                          .burstArtifact, .tooOld, .alreadySeen]
         XCTAssertEqual(Set(all.map(\.rawValue)).count, all.count)
     }
 

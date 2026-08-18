@@ -52,52 +52,87 @@ there is no denominator.
 
 ## Open
 
-### SpO2 epoch-quality fraction has never run on real data
+### SpO2 epoch-quality fraction: only the SUPPRESSING half has been exercised
 - id: spo2-bad-epoch-fraction
 - shipped: 4d0b884 (#73) 2026-08-13, branch `fix/spo2-alert-quality-gate`
 - claim: `maxBadEpochFraction` (0.5, strict `>`) suppresses a run that is mostly motion while
   letting one bad epoch inside a genuine run survive
-- needs: a corroborated run — two readings at/below the SpO2 threshold agreeing within 2 points,
-  inside the 45 min corroboration window
-- blocked-because: every real decision so far (2 of 2, both 2026-08-13/14) short-circuits at
-  `.noCorroboration`, and `evaluateOne` returns on that path BEFORE `resolved` is computed, so
-  the fraction is structurally never reached. Corroboration alone is carrying the feature.
-- check: `desktop/device_alert_audit.py --pull` (phone on USB) — look for any row with
-  `evidenceEpochs > 0`; the tool prints the count of such rows explicitly in its summary
+- needs: BOTH halves in real data — a mostly-bad run logging `badEpochMajority`, AND a
+  partially-bad run (some epochs bad, but not a majority) still firing
+- blocked-because: 🟡 UPDATED 2026-08-18 (device pull, `desktop/device_alert_audit.py --pull`) —
+  now exercised exactly ONCE: `[Aug 16 18:47:22] lowSpO2 suppressed reason=badEpochMajority
+  value=89 reading=Aug 16 18:00:05 run=2 evidence=2/2 bad`, correctly re-derived by the audit
+  tool. That is the SUPPRESSING half only (2 of 2 resolved epochs bad). The survival half — one
+  bad epoch inside a run that still fires — has still never happened on real data; every other
+  logged decision either short-circuits at `.noCorroboration`/`.corroborationDisagrees` before
+  `resolved` is computed, or (the one FIRED row, `2026-08-17 20:42`) resolved zero epochs and rode
+  the fail-open path instead. Corroboration + fail-open are still carrying the feature.
+- check: `desktop/device_alert_audit.py --pull` (phone on USB) — look for a FIRED row with
+  `evidenceEpochs > 0` AND `badEpochs > 0` (that's the still-missing half); the tool's summary
+  line already counts `evidenceEpochs > 0` rows explicitly
 - passes-if: a mostly-moving run logs `badEpochMajority`, AND a still run containing one bad
-  epoch still fires. Either one alone is half the claim.
-- check-after: 2026-08-28
+  epoch still fires. Either one alone is half the claim — the first half is now observed, the
+  second is not.
+- check-after: 2026-09-08
 
-### The evidence fail-open branch has never been taken
-- id: spo2-fail-open-miss
-- shipped: 4d0b884 (#73) 2026-08-13, branch `fix/spo2-alert-quality-gate`
-- claim: when a corroborated run resolves to NO raw records, the alert fires anyway rather than
-  being silently suppressed by a diagnostic detail
-- needs: a corroborated run made entirely of live on-demand readings, which have no `0x4c`
-  record by construction
-- blocked-because: same as `spo2-bad-epoch-fraction` — no corroborated run has occurred at all
-  yet, so neither the resolved nor the unresolved branch below it has been exercised
-- check: `desktop/device_alert_audit.py --pull` — a FIRED row with `evidenceEpochs == 0`
-- passes-if: that row exists and the notification actually arrived on the phone. A fired row with
-  no notification would mean the shared quiet-hours/backoff gate ate it, which is a different bug.
-- check-after: 2026-08-28
-
-### Live-reading miss rate measured 5x higher on device than on the export
+### Live-reading miss rate measured 6x higher than the original estimate, twice now
 - id: spo2-evidence-miss-rate
 - shipped: c3426e0 2026-08-14 (measured by the new audit tool, not changed by it)
 - claim: `spo2_alert_autopsy.py --miss-report` put the evidence-lookup miss rate at 5.3%, and the
   fail-open policy is justified in writing against that number
 - needs: a 30 h snapshot from an ORDINARY day — no app-testing session inflating the count of
   live on-demand readings
-- blocked-because: the 2026-08-14 snapshot measured 25.8% inside the archive span, but that day
-  was full of manual app usage while testing #73, and live readings have no `0x4c` record by
-  construction. Suspected artifact of the testing, not a real regression — unconfirmed either way.
+- blocked-because: 🟡 RE-MEASURED 2026-08-18 (device pull, `desktop/device_alert_audit.py
+  --pull`): **30.7%** (156/225 samples inside the archive's own span resolved). This is a SECOND
+  independent measurement landing well above the original 5.3% estimate — the first
+  (2026-08-14, 25.8%) was set aside as possibly inflated by that day's manual #73 testing, but
+  this snapshot (2026-08-17 02:46 → 2026-08-18 08:46) reflects ordinary wear, not a testing
+  session. Two measurements now agree with each other (25.8%, 30.7%) and disagree with the
+  original 5.3% by the SAME direction and roughly the same margin — the pattern looks like the
+  original figure was measured differently (a different corpus, or a different span-scoping),
+  not like testing-day noise. Per the pre-declared `passes-if` below, this is past the ~20%
+  concern line.
 - check: `desktop/device_alert_audit.py --pull` after a day of normal wear, read the
-  "resolve to a raw record" line
+  "resolve to a raw record" line. `--not-before <ISO8601>` (added 2026-08-18, #spo2-burst-fix)
+  can replay an older snapshot's own span if a third reading is needed without a fresh pull.
 - passes-if: the miss rate lands near 5% and the 5.3% figure in the #73 commit stands. If it
   stays above ~20% on a quiet day, that constant needs re-measuring and the fail-open reasoning
-  needs revisiting.
-- check-after: 2026-08-21
+  needs revisiting. **Two independent readings now both fail this bar** — the fail-open path
+  (D2, `docs/HEALTH_ALERTS_SPO2.md`) is real and load-bearing for a THIRD of SpO2 samples, not a
+  rare diagnostic corner. The original 5.3% commit citation should be re-derived from source
+  before being cited again.
+- check-after: 2026-08-18 (ripe now — re-derive the original 5.3% figure's provenance)
+
+### Burst-artifact rejection + first-sighting gate have never run on a real desaturation or a full week
+- id: spo2-burst-fix-real-world
+- shipped: `fix/spo2-burst-artifacts` 2026-08-18 (#spo2-burst-fix) —
+  `SpO2AlertPolicy.isContradicted`/`burstWindow`/`burstContradictionDelta` (D1, rejects a
+  candidate a healthy reading seconds away refutes) and `HealthNotificationStore`'s first-sighting
+  ledger + `maxNotifiableAge` backstop (D3, a reading gets one chance to fire, on the pass that
+  first sees it). Confirmed against the LOGGED incident only — re-deriving the 2026-08-17 20:42
+  false positive at its pre-incident watermark now returns `noCorroboration` instead of `fired`
+  (see `docs/HEALTH_ALERTS_SPO2.md`). Ships live: changes lowSpO2 output on any run with a tight
+  (≤60s) neighbour, and gates every lowSpO2 notification on first-sighting.
+- claim: (a) the burst rule does not suppress a genuine desaturation — specifically the overnight
+  OSA channel (#91), where readings run at the ~300s sleep cadence, comfortably outside the 60s
+  burst window; (b) the first-sighting gate does not silently swallow a legitimate late-arriving
+  notification (an overnight reading whose corroborator only lands hours later); (c) daytime
+  on-demand bursts, now measured at up to 100 tight pairs across 6 days on this wearer, do not
+  produce a NEW false suppression of a real event
+- needs: (a) at least one night with a genuine, corroborated overnight desaturation under the
+  fixed rule; (b) at least one first-sighting notification that actually posts (proves the ledger
+  doesn't over-suppress); (c) roughly a week of ordinary wear with zero new daytime false-positive
+  reports
+- blocked-because: shipped same day as this entry; no re-staged/re-evaluated data exists yet
+  under the fixed rule
+- check: `desktop/device_alert_audit.py --pull` after ≥7 days; confirm (i) no new `lowSpO2 FIRED`
+  row traces to a burst pair (`contradicted by:` line absent from every FIRED row), (ii) at least
+  one FIRED row exists if any real crossing occurred, and (iii) `desktop/device_alert_audit.py
+  --not-before <pre-fix watermark>` continues to re-derive the 2026-08-17 incident as suppressed
+- passes-if: zero new false-positive `lowSpO2 FIRED` rows over the week, AND at least one
+  genuine crossing (if the wearer has one) still fires. A week with ZERO lowSpO2 candidates at
+  all is inconclusive, not a pass — bump `check-after` rather than counting silence as success.
+- check-after: 2026-08-25
 
 ### The reference-label corpus has one usable night, and the archive rolls over nightly
 - id: sleep-reference-label-corpus
@@ -204,6 +239,33 @@ there is no denominator.
 ---
 
 ## Settled
+
+### The evidence fail-open branch fired for the first time — and it was a false positive — 2026-08-18
+- id: spo2-fail-open-miss
+- was: when a corroborated low-SpO2 run resolves to NO raw `0x4c` records, does the alert fire
+  anyway rather than being silently suppressed by a diagnostic detail — AND does that path stay
+  safe in practice?
+- observed: first-ever exercise, via `desktop/device_alert_audit.py --pull` against the device
+  that produced the reported 12h-late notification:
+  `[2026-08-17 20:42:12] lowSpO2 FIRED reason=fired value=90 reading=2026-08-17 08:45:51 run=2
+  evidence=0/0 bad` — a corroborated run of two on-demand readings, neither resolving to an
+  epoch record, took the fail-open path exactly as designed AND the notification did reach the
+  phone (confirmed by the wearer independently, ~12h after the reading). So the MECHANICAL half
+  of the claim holds: fail-open fired, and fired all the way to a delivered notification, not
+  silently swallowed by the shared gate.
+- but: the fired verdict was a FALSE POSITIVE. Both "corroborating" 90% readings sat 17 seconds
+  from a 98% reading in the same on-demand measurement burst — a burst artifact, not a real
+  desaturation, and something fail-open could not have caught even with resolved epochs (the
+  epoch-quality gate never runs on the fail-open path by definition). Fixed by
+  `fix/spo2-burst-artifacts` — see `docs/HEALTH_ALERTS_SPO2.md` D1 — which rejects a candidate
+  contradicted by a healthy reading seconds away, independent of whether it resolves to an epoch.
+  Re-derived against the fixed rule at the pre-incident watermark: this row no longer fires
+  (`noCorroboration`).
+- still open: fail-open remains untested for a run that (a) resolves to no epochs, (b) survives
+  burst-artifact rejection, and (c) is a GENUINE desaturation — i.e. the case the branch exists
+  to serve, as opposed to the false-positive case that happened to exercise it first. Also see
+  `spo2-evidence-miss-rate`: fail-open is now measured load-bearing for ~30% of samples, not a
+  rare corner.
 
 ### edgeIntensityCut (345) confirmed on a real re-stage — 2026-08-15
 - id: sleep-edge-cut-single-night-fit
