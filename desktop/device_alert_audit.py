@@ -61,7 +61,17 @@ CORROBORATION_WINDOW = 2700
 AGREEMENT_TOLERANCE = 2
 MIN_CORROBORATING = 2
 MAX_BAD_EPOCH_FRACTION = 0.5
+BURST_WINDOW = 60                 # SpO2AlertPolicy.burstWindow
+BURST_CONTRADICTION_DELTA = 4     # SpO2AlertPolicy.burstContradictionDelta
 DEFAULT_THRESHOLD = 90            # HealthAlertThresholds.lowSpO2Percent
+
+# NOTE what this mirror does NOT cover: D3's first-sighting ledger + `maxNotifiableAge` backstop
+# (HealthNotificationCenter's `alerts.lowSpO2.consideredReadings`) are APP-SIDE evaluation-pass
+# history, not a function of the reading series alone — re-deriving them here would mean
+# replaying every past evaluate() pass, not just the final state. A row this mirror re-derives as
+# `fired` that the app actually suppressed as `alreadySeen`/`tooOld` is a MISMATCH this tool
+# cannot resolve; that is a known, stated gap, not silent drift — see the `not_before` caveat
+# below for the same kind of limitation on the pre-existing freshness bound.
 
 BUNDLE_ID = "com.bly.opencircuit"
 DEFAULT_DEVICE = "819D37A3-B45A-56CF-9FEC-40D460EC74F8"   # Jedi Master's iPhone
@@ -219,16 +229,28 @@ def lookup(index, t, tolerance=MATCH_TOLERANCE):
 
 # --------------------------------------------------------------------------- rule mirror
 
-def evaluate_one(trigger, readings, threshold, index):
+def is_contradicted(reading, others):
+    """Mirror of SpO2AlertPolicy.isContradicted. SIGNED: only a HIGHER reading seconds away
+    contradicts — a nearby lower reading is a deepening desaturation, not an artifact."""
+    t, pct = reading
+    return any(t2 != t and abs(t2 - t) <= BURST_WINDOW and (p2 - pct) >= BURST_CONTRADICTION_DELTA
+               for t2, p2 in others)
+
+
+def evaluate_one(trigger, readings, threshold, index, contradicted):
     """Mirror of HealthAlertEvaluator.evaluateOne. Returns (outcome, run, resolved, bad)."""
     t_time, t_pct = trigger
     neighbours = [r for r in readings
                   if r[0] != t_time and abs(r[0] - t_time) <= CORROBORATION_WINDOW]
+    # A burst artifact cannot corroborate — same reasoning as the trigger exclusion below.
     corroborators = [r for r in neighbours
-                     if r[1] <= threshold and abs(r[1] - t_pct) <= AGREEMENT_TOLERANCE]
+                     if r[0] not in contradicted
+                     and r[1] <= threshold and abs(r[1] - t_pct) <= AGREEMENT_TOLERANCE]
     run = [trigger] + corroborators
     if len(run) < MIN_CORROBORATING:
-        low = [r for r in neighbours if r[1] <= threshold]
+        # Discriminator reads the ARTIFACT-FILTERED low neighbours — a run whose only low
+        # neighbour was itself a rejected burst artifact has nothing LEGITIMATE nearby.
+        low = [r for r in neighbours if r[0] not in contradicted and r[1] <= threshold]
         return ("noCorroboration" if not low else "corroborationDisagrees"), len(run), 0, 0
     resolved = [e for e in (lookup(index, r[0]) for r in run) if e is not None]
     if not resolved:
@@ -241,12 +263,21 @@ def evaluate_one(trigger, readings, threshold, index):
 
 def low_spo2(readings, threshold, not_before, index):
     """Mirror of HealthAlertEvaluator.lowSpO2 — every candidate, worst first."""
-    candidates = [r for r in readings if 0 < r[1] <= threshold and r[0] > not_before]
-    if not candidates:
+    # Computed once over the full series, same as the Swift `contradicted` pre-pass.
+    contradicted = {t for t, p in readings if is_contradicted((t, p), readings)}
+
+    all_candidates = [r for r in readings if 0 < r[1] <= threshold and r[0] > not_before]
+    if not all_candidates:
         return ("noCandidate", None, 0, 0, 0)
+
+    candidates = [r for r in all_candidates if r[0] not in contradicted]
+    if not candidates:
+        worst = sorted(all_candidates, key=lambda r: (r[1], r[0]))[0]
+        return ("burstArtifact", worst, 0, 0, 0)
+
     worst = None
     for trig in sorted(candidates, key=lambda r: (r[1], r[0])):
-        outcome, run, resolved, bad = evaluate_one(trig, readings, threshold, index)
+        outcome, run, resolved, bad = evaluate_one(trig, readings, threshold, index, contradicted)
         if outcome == "fired":
             return (outcome, trig, run, resolved, bad)
         if worst is None:
@@ -268,7 +299,7 @@ def spo2_series(store_path):
     return [(float(t), int(round(v * 100))) for t, v in rows if v]
 
 
-def audit(snapshot, threshold):
+def audit(snapshot, threshold, not_before_override=None):
     prefs_path = snapshot / "com.bly.opencircuit.plist"
     store_path = snapshot / "default.store"
     if not prefs_path.exists():
@@ -337,7 +368,19 @@ def audit(snapshot, threshold):
     # verdict on its own.
     not_before = (prefs.get("alerts.health.lastFired") or {}).get("lowSpO2", 0)
     print(f"\n=== health-alert decisions ({len(rows)}) ===")
-    print(f"lowSpO2 freshness bound (last actual firing): {fmt(not_before) if not_before else 'never'}")
+    if not_before_override is not None:
+        # `--not-before` REPLAYS history against a watermark the device has since advanced past.
+        # This exists because the naive check does not discriminate anything: once `lastFired`
+        # sits at the newest FIRED row's own timestamp, EVERY historical row re-derives as
+        # `noCandidate` (its trigger is older than `notBefore` by construction) regardless of
+        # whether a rule change fixed anything — that artifact IS the standing
+        # `re-derivation mismatches` count on an unmodified snapshot. Pin `not_before` to a point
+        # BEFORE the incident under investigation (e.g. the watermark from before it fired) to get
+        # a re-derivation that actually exercises the rule instead of vacuously agreeing.
+        not_before = not_before_override
+        print(f"lowSpO2 freshness bound: OVERRIDDEN to {fmt(not_before)} (--not-before)")
+    else:
+        print(f"lowSpO2 freshness bound (last actual firing): {fmt(not_before) if not_before else 'never'}")
 
     mismatches = 0
     quality_gate_exercised = 0
@@ -374,6 +417,17 @@ def audit(snapshot, threshold):
         ev = lookup(index, reading_t)
         print(f"    archive evidence: {evidence_summary(ev) if ev else 'NONE (no 0x4c record)'}")
 
+        if outcome == "burstArtifact":
+            # Name the contradicting neighbour — same reason `neighbourhood` exists: a burst
+            # rejection is only judgeable by eye if the reading that refuted it is visible too.
+            burst = [x for x in window
+                     if x[0] != reading_t and abs(x[0] - reading_t) <= BURST_WINDOW
+                     and (x[1] - r.get("value", 0)) >= BURST_CONTRADICTION_DELTA]
+            if burst:
+                t2, p2 = min(burst, key=lambda x: abs(x[0] - reading_t))
+                print(f"    contradicted by: {p2}% at {fmt(t2)} "
+                      f"({abs(t2 - reading_t):.0f}s away, in the same on-demand burst)")
+
     print(f"\n=== summary ===")
     print(f"decisions: {len(rows)}, fired: {sum(1 for r in rows if r.get('fired'))}, "
           f"suppressed: {sum(1 for r in rows if not r.get('fired'))}")
@@ -394,13 +448,20 @@ def main():
                     default=Path(__file__).parent / "captures" / "device-snapshot",
                     help="snapshot directory (default under captures/, which is gitignored)")
     ap.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
+    ap.add_argument("--not-before", type=str, default=None,
+                    help="ISO8601 local time (e.g. 2026-08-13T15:32:25) to REPLAY history "
+                         "against instead of the device's current lastFired watermark — needed "
+                         "because the current watermark makes every historical row vacuously "
+                         "re-derive as noCandidate. See the doc comment in audit().")
     args = ap.parse_args()
 
     if args.pull:
         print(f"pulling from {args.device} -> {args.dir}")
         pull(args.device, args.dir)
         print()
-    audit(args.dir, args.threshold)
+    not_before_override = (datetime.fromisoformat(args.not_before).timestamp()
+                           if args.not_before else None)
+    audit(args.dir, args.threshold, not_before_override=not_before_override)
 
 
 if __name__ == "__main__":

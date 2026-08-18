@@ -55,9 +55,12 @@ struct ActivityLogView: View {
         return Array(metricRecords.filter { $0.date >= cutoff }.reversed())
     }
 
+    /// Filtered on `incidentTime`, not `date` — the period picker says "show me what happened in
+    /// the last day", and a row decided this evening about an event from three days ago belongs
+    /// to the THREE-day view, not this one. See `HealthAlertRecord.incidentTime`.
     private var filteredAlertRecords: [HealthAlertRecord] {
         guard let cutoff = period.cutoff() else { return Array(alertRecords.reversed()) }
-        return Array(alertRecords.filter { $0.date >= cutoff }.reversed())
+        return Array(alertRecords.filter { $0.incidentTime >= cutoff }.reversed())
     }
 
     /// Decode-sanity warnings worth surfacing here without opening Device Info: a firmware
@@ -207,7 +210,11 @@ struct ActivityLogView: View {
         lines.append("--- Health alerts (\(filteredAlertRecords.count)) ---")
         for r in filteredAlertRecords {
             let icon = r.fired ? "!" : "-"
-            lines.append("\(icon) [\(df.string(from: r.date))] \(alertTitle(r)) — \(alertDetail(r))")
+            // Both timestamps, explicitly labelled — the reported incident was exactly a case
+            // where conflating "when the incident happened" with "when the decision ran" (12h
+            // apart) made the log unreadable. See `HealthAlertRecord.incidentTime`.
+            lines.append("\(icon) [incident \(df.string(from: r.incidentTime))] "
+                        + "[decided \(df.string(from: r.date))] \(alertTitle(r)) — \(alertDetail(r))")
         }
 
         lines.append("")
@@ -318,7 +325,7 @@ struct ActivityLogView: View {
                 HStack {
                     Text(alertTitle(record)).font(.subheadline.weight(.medium))
                     Spacer()
-                    Text(record.date, format: .dateTime.month().day().hour().minute())
+                    Text(record.incidentTime, format: .dateTime.month().day().hour().minute())
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 Text(alertDetail(record)).font(.caption).foregroundStyle(.secondary)
@@ -369,12 +376,23 @@ struct ActivityLogView: View {
             let unit = record.notification == HealthNotification.lowSpO2.rawValue ? "%" : " bpm"
             parts.append("\(Int(record.value.rounded()))\(unit)")
         }
-        if let t = record.readingTime {
-            parts.append("reading \(Self.alertReadingTimeFormatter.string(from: t))")
+        // The headline already shows `incidentTime` (= `readingTime` when present). Naming the
+        // DECISION time here is only informative when it's meaningfully different — otherwise it's
+        // noise on every single row. 5 min covers ordinary evaluation latency without hiding a
+        // genuinely late decision like the reported 12h-late incident.
+        if abs(record.date.timeIntervalSince(record.incidentTime)) > 300 {
+            parts.append("decided \(Self.alertReadingTimeFormatter.string(from: record.date))")
         }
         if record.runSize > 0 { parts.append("run \(record.runSize)") }
         if record.evidenceEpochs > 0 {
             parts.append("\(record.badEpochs)/\(record.evidenceEpochs) epochs bad")
+        } else if record.fired && record.notification == HealthNotification.lowSpO2.rawValue {
+            // A FIRED SpO2 row with no evidence rode the fail-open path — an on-demand reading has
+            // no `0x4c` record BY CONSTRUCTION, so this is the normal case for that population, not
+            // a miss. Worth naming explicitly: it's the difference between "we checked the quality
+            // bytes and they were fine" and "there was nothing to check", currently invisible here
+            // on exactly the rows where that distinction matters most.
+            parts.append("no epoch evidence (on-demand)")
         }
         if let e = record.evidenceSummary { parts.append(e) }
         return parts.joined(separator: " · ")
@@ -384,6 +402,9 @@ struct ActivityLogView: View {
         switch reason {
         case "gated.quietHours": return "quiet hours"
         case "gated.backoff": return "already alerted recently"
+        case "burstArtifact": return "a healthy reading seconds away contradicts it"
+        case "alreadySeen": return "already evaluated on an earlier pass"
+        case "tooOld": return "the reading was too old to notify"
         case "noCorroboration": return "no second low reading to corroborate it"
         case "corroborationDisagrees": return "nearby low readings disagree"
         case "badEpochMajority": return "the ring was moving / not worn"

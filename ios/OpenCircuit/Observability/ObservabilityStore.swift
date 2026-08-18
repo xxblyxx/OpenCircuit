@@ -85,6 +85,18 @@ struct HealthAlertRecord: Codable, Identifiable, Equatable {
     /// Human-readable one-liner of the epoch evidence, or nil when none resolved.
     var evidenceSummary: String?
 
+    /// When the incident actually happened, falling back to the decision time for rows with no
+    /// reading of their own (the HR/temp/fever/reminder families, which don't carry `readingTime`).
+    ///
+    /// WHY THIS EXISTS: `date` is when the decision RAN, not when the reading was TAKEN — a
+    /// background pass can evaluate a reading hours after it happened (the 12h `instantLookback`
+    /// is wide on purpose; see `HealthNotificationCenter`). A 2026-08-17 incident showed this
+    /// concretely: a genuine 90% SpO2 reading at 8:45 AM produced a row stamped 8:42 PM, because
+    /// that was simply the first pass whose worst-first search happened to land on it. Every
+    /// display of a row's "when" — the pane headline, the period filter, the export — must read
+    /// THIS, not `date`, or it silently reports the wrong moment as the incident.
+    var incidentTime: Date { readingTime ?? date }
+
     /// Explicit, since providing `init(from:)` below suppresses Swift's synthesized memberwise
     /// initializer — this keeps every existing construction call site unchanged.
     init(id: UUID = UUID(), date: Date, notification: String = "", fired: Bool = false,
