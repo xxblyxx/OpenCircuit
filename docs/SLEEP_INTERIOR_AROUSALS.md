@@ -103,6 +103,23 @@ existing motion gate; only the smaller stirs on that particular night are lost. 
 placeholder-*share* threshold, which is exactly the kind of constant §1b's own corpus measurement
 warns against inventing without evidence. Revisit only if this is observed to bite.
 
+### Measured 2026-08-18 — the fix works, the cut does not generalize
+
+First check of §1b against real re-staged nights. **The fix is confirmed**: the 08-14/15 night
+(re-staged 08-16 05:52, after the fix) now yields 9 merged interior awakenings / 32.5 m WASO where
+the pre-§1b run was byte-identical `0.0m`, with the in-bed window unmoved — the strictly-interior
+guard holds.
+
+**`arousalIntensityCut = 200` does not.** `--sweep-arousal-cut` at that value gave **3 awakenings
+on 08-16/17 and 22 on 08-17/18** — consecutive nights, same code. On 08-16/17 no cut down to 50
+exceeded 4, against Whoop's 27 labelled in-window awake intervals; and nearly every detection is a
+single 2.5 m epoch, which is what a threshold sitting in noise looks like. §4's "DONE, 200 chosen"
+should be read as *chosen on one night, since refuted as a global constant*. The live value is
+unchanged for now — see `docs/PENDING_VALIDATION.md` → `sleep-arousal-cut-single-night-fit`
+(settled, with the numbers) and `sleep-arousal-cut-refit` (open), where the question is now whether
+a global constant can work at all or whether this needs a per-night adaptive threshold. Note that
+the ~30 h epoch archive means the corpus to decide that can only be built **forward**.
+
 ## 2. The change
 
 Add a SECOND, lower cut that applies **only strictly between sleep onset and final wake**, only on

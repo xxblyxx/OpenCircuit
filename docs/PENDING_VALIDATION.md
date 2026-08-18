@@ -175,44 +175,76 @@ there is no denominator.
   informative, not that it was once.
 - check-after: 2026-08-29
 
-### arousalIntensityCut (200) is fitted on ONE night, and hasn't been checked against a real re-staged night with the working code
-- id: sleep-arousal-cut-single-night-fit
-- shipped: `feat/sleep-awake-diagnostics` 2026-08-15 — `SleepStaging.Tuning.arousalIntensityCut`
-  (`markInteriorArousals`, `docs/SLEEP_INTERIOR_AROUSALS.md` §1b). Ships live: this DOES change
-  classifier output on any night using the intensity-tail fallback path.
-- claim: `arousalIntensityCut = 200` produces 5–8 interior awakenings/night — RingConn's own
-  5.8/night average — without moving onset or final wake, on real nights generally (not just the
-  one it was fitted on)
-- needs: (a) at least one night the ring has re-staged WITH THE §1b FIX (the whole-block-vs-interior
-  motion-source bug), and (b) ideally several more paired label+epoch nights (see
-  `sleep-reference-label-corpus`) so the fit isn't resting on the single 2026-08-14/15 night it was
-  chosen from
-- blocked-because: 🟢 MEASURED same day — the FIRST re-stage attempt (force-quit + Bluetooth
-  toggle, confirmed via `ZUPDATEDAT` moving to 08-15 16:36:16) proved the app DOES re-stage from
-  the persisted archive on reconnect without waiting for a fresh overnight sync
-  (`RingSession.restageFromArchive`), but it ALSO proved the shipped pass was inert: the interior
-  column stayed exactly `0.0m`, byte-identical to before the fix. Root cause found and fixed same
-  day (§1b: the channel-selection verdict was scoped to the whole in-bed block, where 3 real
-  getting-up epochs disqualified it, rather than the sleep interior). The re-stage mechanism is
-  no longer the blocker — only a re-run WITH the fix installed is.
-- check: force-quit the app, toggle Bluetooth off/on, reopen (triggers a fresh
-  `restageFromArchive` — no need to wait for an overnight sync), then
-  `desktop/sleep_reference_labels.py --pull --compare-own`; separately,
-  `desktop/sleep_reference_labels.py --pull --sweep-arousal-cut` on new paired nights as they
-  accumulate, to see whether 200 still lands in range or needs re-fitting
-- passes-if: the re-staged night's OC interior column in `--compare-own` shows a nonzero,
-  plausible awakening count (roughly 0–15 min per awakening, total WASO not wildly larger than the
-  night's total awake time), AND the in-bed window is unchanged at exactly
-  `08-14 22:15:56 .. 08-15 08:23:26` (moving means the strictly-interior guard leaked). A flat
-  0.0m again means either a NEW variant of the channel-selection bug, or that this specific
-  night's interior itself now includes real primary motion (in which case §1b's own documented
-  "known limitation" is the explanation, not a new bug).
-- check-after: 2026-08-15 (same day — no longer needs to wait for morning; a forced reconnect is
-  sufficient, see `check` above)
+### A single global arousalIntensityCut may not be fittable at all — 200 gave 3 and 22 on consecutive nights
+- id: sleep-arousal-cut-refit
+- shipped: `arousalIntensityCut = 200` is LIVE and unchanged (`SleepStaging.Tuning`,
+  `markInteriorArousals`, `docs/SLEEP_INTERIOR_AROUSALS.md` §1b). Nothing was changed in response
+  to the 2026-08-18 measurement — this entry exists because the shipped value is now known to be
+  wrong-or-unstable, not because a fix is awaiting confirmation.
+- claim: the open question is no longer "is 200 the right number" but whether a GLOBAL constant on
+  the `[15:20]` intensity tail can work at all. See `sleep-arousal-cut-single-night-fit` under
+  `## Settled`: at cut=200 the same code produced 3 awakenings on 08-16/17 and 22 on 08-17/18. If
+  no constant lands in a plausible band across nights, the successor is a per-night adaptive
+  threshold (e.g. a percentile of that night's own interior tail distribution), not a re-fitted
+  constant.
+- needs: paired label+epoch nights — a night with BOTH reference labels (Whoop/RingConn, imported
+  via Diagnostics) AND its raw epochs still in the archive. Target ≥5 before re-fitting anything.
+- blocked-because: ⚠️ THE CORPUS CAN ONLY BE BUILT FORWARD. The raw epoch archive holds roughly
+  30 h, and `--sweep-arousal-cut` can only sweep a night whose epochs are still in it — on
+  2026-08-18 it reported "no raw epochs in the pulled archive for this night" for all four nights
+  older than that. The 2026-08-14/15 night the cut was originally fitted on **can never be swept
+  again**; its epochs are gone. Every future night must be pulled WITHIN ~30 h of waking or it is
+  lost the same way. Same constraint as `sleep-reference-label-corpus`.
+- check: `desktop/sleep_reference_labels.py --pull --sweep-arousal-cut` within 30 h of each night,
+  keeping each snapshot; once ≥5 paired nights are banked, look for a cut whose count lands in
+  4–10/night on ALL of them
+- passes-if: some single cut value puts the merged interior awakening count in 4–10 on every banked
+  night (then re-fit `arousalIntensityCut` to it). If the best global cut still spans e.g. 2 and 20
+  across nights, that is the REFUTATION of the global-constant approach and the entry closes by
+  redirecting to a per-night adaptive threshold — a real outcome, not a failure to check.
+- check-after: 2026-08-25
 
 ---
 
 ## Settled
+
+### §1b's fix works; arousalIntensityCut = 200 does NOT generalize — 2026-08-18
+- id: sleep-arousal-cut-single-night-fit
+- was: does `arousalIntensityCut = 200` (`markInteriorArousals`, `docs/SLEEP_INTERIOR_AROUSALS.md`
+  §1b, shipped `feat/sleep-awake-diagnostics` 2026-08-15) produce 5–8 interior awakenings/night —
+  RingConn's own 5.8/night — without moving onset or final wake, on real nights generally and not
+  just the 2026-08-14/15 night it was fitted on?
+- observed, mechanism ✅: the pass is no longer inert. The 08-14/15 night, re-staged 08-16 05:52:44
+  (i.e. after the §1b fix), now yields **9 merged interior awakenings / 32.5 m WASO**, where the
+  pre-§1b run was byte-identical `0.0m`. Its in-bed window is unmoved at exactly
+  `08-14 22:15:56 .. 08-15 08:23:26`, so the strictly-interior guard holds — the whole-block-vs-
+  interior channel-selection bug is genuinely fixed. Per-night merged counts across the four nights
+  re-staged since the fix: **9, 6, 1, 22**. (The two older nights still showing 0 were last staged
+  08-13/08-14, BEFORE the fix — stale staging, not a failure of the pass.)
+- observed, value ❌: `--sweep-arousal-cut` on the two nights whose raw epochs were still in the
+  archive is what refutes the claim. At cut=200, on **consecutive nights**:
+
+  ```
+  08-16 22:07 .. 08-17 08:24   cut=200 →  3 awakenings,  7.5m WASO   (WHOOP labelled 27 in-window)
+  08-17 22:20 .. 08-18 08:10   cut=200 → 22 awakenings, 75.0m WASO   (no reference labels)
+  ```
+
+  On 08-16/17 no cut swept, down to 50, reaches more than 4 — the tail channel carried almost
+  nothing that night against Whoop's 27 labelled awake intervals. On 08-17/18 the same constant
+  produces 22. A value that swings 3→22 night to night is not "5–8/night on real nights generally".
+  Corroborating: nearly every detected awakening is exactly one 2.5 m epoch, the hallmark of a
+  threshold sitting in the noise rather than on a signal.
+- note on the numbers: two interior awakenings less than `MERGE_TOLERANCE_SECONDS` (150 s) apart
+  merge into one, and the merged span includes the gap — so the canonical metric (the port of
+  Swift's `SleepAwakenings.from`, what `--compare-own` prints and what ships) reads **9 awakenings
+  / 32.5 m** for 08-14/15, while a raw segment count of the stored hypnogram reads 11 / 27.5 m.
+  Both are correct at different definitions; this file cites the merged one throughout.
+- provenance: the force-quit + Bluetooth-toggle re-stage run on 2026-08-18 **produced none of this
+  data** — max `ZUPDATEDAT` stayed at 08-18 08:28:42, that morning's ordinary re-stage. The recipe
+  is not broken; it can only re-stage nights whose epochs are still inside the ~30 h archive, and
+  every night here was already outside it. The confirming re-stages had happened on their own.
+- still open: see `sleep-arousal-cut-refit` under `## Open` — with the sharper question (can a
+  global constant work at all?) and the constraint that the corpus can now only be built forward.
 
 ### The sleep-mirror ratchet survived a real re-stage cycle — 2026-08-18
 - id: sleep-health-mirror-idempotent
