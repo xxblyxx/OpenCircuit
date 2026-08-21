@@ -216,6 +216,72 @@ public enum SleepStaging {
         /// "awake until 2 a.m." ~48 ≈ 2 h.
         public var onsetSearchEpochs: Int
 
+        // --- Lead-in sleep-vitals density (the "quiet-awake-on-a-phone" fix) ---------
+        // Every onset pass above keys off HR and/or motion; both are BLIND to a wearer who is lying
+        // still, at resting HR, deliberately awake (a phone, reading) — that stretch is
+        // physiologically indistinguishable from sleep on those two channels alone. 🟢 MEASURED
+        // 2026-08-20/21: 22:09–23:44 sat at HR 54–73 (mean 61.4) with motion at floor throughout —
+        // `markLeadInWakeOnset`'s own `minConsolidatedSleepEpochs` guard (correctly) refuses to
+        // re-anchor onset past that 95-minute quiet stretch, so onset anchored at 22:11 against a
+        // real onset (Apple Watch + NOOP, both independently) of ~00:48 — 2.5 h early.
+        //
+        // The ring itself already carries a discriminator neither HR nor motion sees: SLEEP-VITALS
+        // (HRV-bearing) epoch DENSITY. 🟢 MEASURED same night: the quiet-awake stretch carried
+        // sleep-vitals on 21% of epochs vs. 50% once real sleep began — the ring measures sleep more
+        // often once the wearer is actually asleep, a signal already trusted elsewhere in this file
+        // (`sleepVitalsRescue`, `rescueSecondBoutHRWake`'s guard (e), and `markPointOfNoReturnOffset`'s
+        // terminal-REM guard, which compares this exact suffix-vs-body density ratio at the TRAILING
+        // edge). `markLeadInVitalsAwake` is that same density comparison, mirrored to the LEADING edge.
+        //
+        // `0` DISABLES the pass entirely — byte-identical to pre-this-feature staging.
+        //
+        // 🔴 REFUTED AND DISABLED (default `0`), 2026-08-21 — same day it shipped at 0.6, by replaying
+        // the very night it was fitted on through the real archive. Density separates the two stretches
+        // in AGGREGATE (21% vs 50%) but NOT block-by-block: the ring's sleep-vitals emission is
+        // irregular, so a 6-epoch window inside the quiet-awake stretch can read 0.333 against a 0.283
+        // cutoff. The block scan therefore halts on the first such window and onset lands at 22:41 —
+        // 2 h short of the real 00:48. Widening the search horizon to 63/72/96 epochs changes NOTHING
+        // (all still 22:41), which is what proves the stop rule, not the horizon, is what binds.
+        // Superseded by `leadInMotionOnsetMinRun` below, which reads the channel that actually
+        // separates on this device. Kept (not deleted) as a tested kill-switched pass and as the
+        // record of a refuted approach — same discipline as `arousalIntensityCut`
+        // (docs/SLEEP_INTERIOR_AROUSALS.md §1b). See docs/PENDING_VALIDATION.md →
+        // lead-in-vitals-ratio-refit.
+        public var leadInVitalsAwakeRatio: Double
+
+        // --- Lead-in MOTION onset (the "got up and did something" fix) ---------------
+        // The pass that actually fixes the 2026-08-20/21 night, and the mirror of how a wearable with
+        // no hypnogram of its own is supposed to find onset: SLEEP STARTS WHEN THE MOVING STOPS.
+        //
+        // 🟢 MEASURED on that night's real archive, replayed through this exact code path. Using the
+        // EXISTING de-floored motion channel and the EXISTING `awakeMotion` (15) cut, the whole
+        // 258-epoch night has motion above the cut in exactly THREE clusters:
+        //     epochs   1– 9  (21:42–22:04)  getting into bed
+        //     epochs  49–71  (23:44–00:39)  got up, worked at a computer   <-- the real lead-in
+        //     epochs 247–256 (07:59–08:21)  morning wake
+        // Epochs 72–246 (00:41–07:56) are SILENT — 175 consecutive epochs, the actual sleep. So
+        // "onset = the epoch after the last sustained leading-region motion" lands on epoch 72 =
+        // 00:41:36, against Apple Watch 00:59 and NOOP 00:48:55 (which differ from EACH OTHER by 6 min).
+        //
+        // Why this succeeds where `markEdgeMotionAwake` (`edgeIntensityCut`) cannot: that pass reads
+        // the `[15:20]` INTENSITY TAIL, which on this night is noise — 359–592 during quiet wakefulness
+        // but also 0–440 during confirmed sleep, so no cut separates them. The de-floored MOTION channel
+        // does, decisively (0 while still, 21–186 while up). Different channel, not a different constant.
+        //
+        // Minimum length (in epochs) of a leading-region motion run that may re-anchor onset — and the
+        // ONLY thing separating "got up and did something" from a mid-night stir, since the usual
+        // "consolidated sleep behind it" guard is useless on exactly the night this pass exists for
+        // (that lead-in reads as ASLEEP, which is the bug). 🟢 measured: stir 3 epochs (~7.5 min) vs.
+        // getting-up 23 epochs (~57 min), so 6 (15 min) sits in a wide gap rather than on a knife edge.
+        // `0` DISABLES the pass entirely — byte-identical to pre-this-feature staging.
+        //
+        // 🟡 FITTED ON ONE NIGHT. The separation is far wider than `arousalIntensityCut`'s was (a clean
+        // 0-vs-21+ gap, versus a threshold sitting inside noise), and it reuses an already-validated
+        // cut rather than introducing a new magnitude — but it is still one night, and the ~30 h archive
+        // means no older night can be replayed. Tracked: docs/PENDING_VALIDATION.md →
+        // lead-in-motion-onset-refit.
+        public var leadInMotionOnsetMinRun: Int
+
         // --- Point-of-no-return OFFSET (the "quiet morning wake" fix) ----------------
         // `wakeHRMarginBPM` is ONE knob doing TWO jobs: it must sit ABOVE typical REM elevation
         // (or REM reads as wake) AND catch the morning rise. When a night's morning rise is SMALLER
@@ -519,6 +585,8 @@ public enum SleepStaging {
                     onsetMinDescentBPM: Double = 10,
                     onsetScanEpochs: Int = 12,
                     onsetSearchEpochs: Int = 48,
+                    leadInVitalsAwakeRatio: Double = 0,
+                    leadInMotionOnsetMinRun: Int = 6,
                     offsetNoReturnSpreadFraction: Double = 0.5,
                     offsetNoReturnMinMarginBPM: Double = 2,
                     minConsolidatedSleepEpochs: Int = 16,
@@ -556,6 +624,8 @@ public enum SleepStaging {
             self.onsetMinDescentBPM = onsetMinDescentBPM
             self.onsetScanEpochs = onsetScanEpochs
             self.onsetSearchEpochs = onsetSearchEpochs
+            self.leadInVitalsAwakeRatio = leadInVitalsAwakeRatio
+            self.leadInMotionOnsetMinRun = leadInMotionOnsetMinRun
             self.offsetNoReturnSpreadFraction = offsetNoReturnSpreadFraction
             self.offsetNoReturnMinMarginBPM = offsetNoReturnMinMarginBPM
             self.minConsolidatedSleepEpochs = minConsolidatedSleepEpochs
@@ -936,6 +1006,21 @@ public enum SleepStaging {
         // if a sustained awake block still lies ahead in the search window (and no real sleep preceded
         // it), onset hasn't happened yet — mark everything up to that block's end as awake-in-bed.
         markLeadInWakeOnset(&awake, tuning: tuning)
+
+        // --- Lead-in vitals-density onset: catch the quiet-but-AWAKE lead-in HR can't see ----
+        // The two onset passes above both key off HR; a wearer quietly awake at RESTING HR (a phone,
+        // reading) clears neither. Runs AFTER them so it only ever narrows what they left asleep, using
+        // the ring's own sleep-vitals cadence as the discriminator instead of HR/motion. See
+        // `markLeadInVitalsAwake`'s doc for the mechanism; `0` (the default) disables it.
+        markLeadInVitalsAwake(&awake, vitals: rows.map(\.vitals), tuning: tuning)
+
+        // --- Lead-in MOTION onset: sleep starts when the moving stops ----------------
+        // Runs LAST of the leading-edge passes, so it gets the final word at the head: the other three
+        // read HR (blind to a still, resting-HR wearer) or sleep-vitals density (🔴 refuted); this reads
+        // the channel that actually separates lying-still-awake from asleep on this device. Only ever
+        // ADDS leading awake, and is reverted unless a consolidated asleep run survives — so on a night
+        // it does not recognise, the head is exactly what the passes above left.
+        markLeadInMotionOnset(&awake, motionAwake: motionAwake, tuning: tuning)
 
         // --- Point-of-no-return OFFSET: mark the trailing "never settled again" run -
         // Runs AFTER both onset passes so they keep the last word at the head, and only ever ADDS
@@ -1356,6 +1441,160 @@ public enum SleepStaging {
         }
         guard longest < tuning.minConsolidatedSleepEpochs else { return }
         for k in 0 ... be { awake[k] = true }
+    }
+
+    /// Push sleep ONSET past a QUIET-BUT-AWAKE lead-in that neither HR nor motion can see — the still,
+    /// resting-HR wearer using a phone or reading in bed, deliberately awake. Neither `markDescentOnsetAwake`
+    /// nor `markLeadInWakeOnset` can catch this: both need HR to be somewhere above the night's floor, and
+    /// a person quietly awake at rest often isn't. The ring's own sleep-vitals (HRV) cadence is the
+    /// discriminator: it fires far more often once the wearer is ACTUALLY asleep than while quietly awake
+    /// (🟢 measured 2026-08-20/21: 21% vs 50% epoch density — see `Tuning.leadInVitalsAwakeRatio`).
+    ///
+    /// The REFERENCE density is measured PAST the search window (`[onsetSearchEpochs, n)`) — the part of
+    /// the block `sleepSpan` is guaranteed to find real sleep in, since the block exists at all. Walking
+    /// forward through the search window one `onsetSustainEpochs`-wide block at a time (so a transition
+    /// mid-window isn't averaged away by a single aggregate run), the FIRST block whose OWN sleep-vitals
+    /// density is NOT thin relative to the reference (ratio above `leadInVitalsAwakeRatio`) is where real
+    /// sleep starts; every already-asleep epoch strictly before it is re-marked awake. A night whose
+    /// lead-in truly settles into sleep from the first block is left untouched.
+    ///
+    /// GUARDED, one-directional: only ever converts a quiet epoch that ALREADY reads asleep to awake
+    /// (never touches an epoch another pass already marked awake), only within `onsetSearchEpochs`, and
+    /// no-ops when there's no reference region to compare against (a night shorter than the search
+    /// window has nothing past it to prove real sleep by). `0` disables the pass entirely.
+    private static func markLeadInVitalsAwake(_ awake: inout [Bool], vitals: [Bool], tuning: Tuning) {
+        guard tuning.leadInVitalsAwakeRatio > 0, vitals.count == awake.count else { return }
+        let n = awake.count
+        let limit = min(tuning.onsetSearchEpochs, n)
+        let blockSize = max(1, tuning.onsetSustainEpochs)
+        guard limit > 0, limit < n else { return }   // no reference region past the search window
+
+        let reference = limit ..< n
+        let referenceDensity = Double(reference.filter { vitals[$0] }.count) / Double(reference.count)
+        guard referenceDensity > 0 else { return }   // no vitals coverage at all → nothing to judge against
+
+        var cut = 0   // everything strictly before `cut` gets re-marked awake
+        var i = 0
+        while i < limit {
+            let end = min(i + blockSize, limit) - 1
+            let block = i ... end
+            let density = Double(block.filter { vitals[$0] }.count) / Double(block.count)
+            guard density <= referenceDensity * tuning.leadInVitalsAwakeRatio else { break }
+            cut = end + 1
+            i = end + 1
+        }
+        guard cut > 0 else { return }
+        for k in 0 ..< cut where !awake[k] { awake[k] = true }
+    }
+
+    /// How far into the night `markLeadInMotionOnset` may look, in epochs. **This pass only** — the
+    /// HR-based onset passes deliberately keep the fixed `onsetSearchEpochs` bound.
+    ///
+    /// 🟢 MEASURED 2026-08-20/21: the real onset sat at epoch 72 (00:41) while the fixed bound stopped
+    /// at epoch 48 (23:41), so the answer was STRUCTURALLY out of reach — nothing looked there.
+    ///
+    /// ⚠️ WHY NOT WIDEN THE HR PASSES TOO (tried, reverted — it broke four tests, correctly).
+    /// `onsetSearchEpochs` is not merely a performance bound on those passes, it is a STATEMENT OF
+    /// EPISTEMIC LIMIT: `testLateSettleBeyondSearchWindowIsNotTrimmed` pins that a night which stays
+    /// elevated for hours and only settles late must NOT be declared "awake until 2 a.m." — because HR
+    /// alone cannot distinguish a long quiet wakefulness from an unusual sleep architecture, and
+    /// guessing over a multi-hour window is how a night loses hours of real sleep. That argument holds
+    /// for HR and does NOT hold here: this pass keys on RECORDED MOVEMENT, positive evidence that the
+    /// wearer was up and about, not an inference from an ambiguous level. Widening the reach is only
+    /// defensible for the pass that has the evidence.
+    ///
+    /// Returns at least `onsetSearchEpochs` (never SHORTER than the fixed bound — this widens, never
+    /// narrows) and at most half the block, so a consolidated second half always survives to anchor
+    /// `sleepSpan`.
+    static func onsetSearchReach(epochCount n: Int, tuning: Tuning) -> Int {
+        guard n > 0 else { return 0 }
+        return min(max(tuning.onsetSearchEpochs, n / 2), n)
+    }
+
+    /// Anchor sleep ONSET after the last SUSTAINED motion episode in the leading region — "sleep starts
+    /// when the moving stops", the rule a ring with no onboard hypnogram has to fall back on.
+    ///
+    /// This is the pass that fixes the quiet-awake-then-got-up night. `markLeadInWakeOnset` and
+    /// `markDescentOnsetAwake` both need HR to be ELEVATED to see a lead-in, and a wearer lying still
+    /// on a phone at resting HR clears neither; `markLeadInVitalsAwake` tried sleep-vitals density and
+    /// is 🔴 refuted (see `Tuning.leadInVitalsAwakeRatio`). The de-floored MOTION channel separates the
+    /// same night cleanly — see `Tuning.leadInMotionOnsetMinRun` for the byte-exact measurement.
+    ///
+    /// Marks every epoch up to and including the END of the LAST motion run of `minRun`+ epochs that
+    /// BEGINS in the leading region. Uses `motionAwake` — the SAME per-epoch verdict the main wake gate
+    /// already trusts (`awakeMotion`, de-floored, vitals-softened) — so it introduces no new magnitude
+    /// and inherits the softening that keeps a moving-but-asleep morning from reading as wake.
+    ///
+    /// GUARDED, and each guard blocks a distinct false positive:
+    ///   (a) KILL SWITCH — `minRun <= 0` disables it (byte-identical to pre-this-feature staging).
+    ///   (b) SUSTAINED ONLY — a run shorter than `minRun` is a stir, not getting up, and is ignored.
+    ///   (c) LEADING REGION ONLY — the run must BEGIN within `onsetSearchReach`, so the morning wake
+    ///       can never re-anchor onset. (It may EXTEND past the boundary; what matters is where the
+    ///       getting-up started.)
+    ///   (d) THE RUN'S OWN LENGTH IS THE WASO DISCRIMINATOR, and this is the guard that took two
+    ///       tries to get right. The obvious guard — "no consolidated sleep behind it", which
+    ///       `markLeadInWakeOnset` and `rescueSecondBoutHRWake` both use — DOES NOT WORK HERE, 🟢
+    ///       measured: on the grounding night the 2 h quiet-but-awake lead-in READS AS ASLEEP in the
+    ///       mask (that is the whole bug), so it clears `minConsolidatedSleepEpochs` and the guard
+    ///       classified the real getting-up as WASO, reverting onset to 22:11. What actually separates
+    ///       the two cases is the DURATION OF THE MOTION ITSELF: a genuine mid-night stir is a turn in
+    ///       bed (`testHighMotionMidSleepIsAwake`: 3 epochs ≈ 7.5 min), while getting up to do
+    ///       something runs far longer (the measured desk trip: 23 epochs ≈ 57 min). `minRun` is that
+    ///       line, and it is why the default is 6 (15 min) rather than a token 2–3.
+    ///   (e) NEVER EARLIER — it only ever moves onset LATER, so a night it does not understand keeps
+    ///       whatever the other passes decided.
+    ///   (f) SURVIVAL — reverted unless a CONSOLIDATED asleep run (`minConsolidatedSleepEpochs`, the
+    ///       same bar `markEdgeMotionAwake` and `markPointOfNoReturnOffset` use) still exists
+    ///       afterwards, so it can never reduce a night to a token fragment.
+    /// Test seam, mirroring `markPointOfNoReturnOffset`'s reason for being `internal`: on a SYNTHETIC
+    /// night another pass reaches the same answer first (a fabricated record has a clean `[15:20]`
+    /// tail, where the real ring's is noise), so an end-to-end on/off comparison cannot isolate this
+    /// pass. Driving the mask directly is the only honest unit test; the real-archive control is
+    /// recorded in `Tuning.leadInMotionOnsetMinRun`.
+    static func markLeadInMotionOnsetForTesting(_ awake: inout [Bool], motionAwake: [Bool],
+                                                tuning: Tuning) {
+        markLeadInMotionOnset(&awake, motionAwake: motionAwake, tuning: tuning)
+    }
+
+    private static func markLeadInMotionOnset(_ awake: inout [Bool], motionAwake: [Bool],
+                                              tuning: Tuning) {
+        guard tuning.leadInMotionOnsetMinRun > 0,                      // (a)
+              motionAwake.count == awake.count, !awake.isEmpty else { return }
+        let n = awake.count
+        let reach = onsetSearchReach(epochCount: n, tuning: tuning)
+        guard reach > 0 else { return }
+
+        // CLUSTER first, then measure. A real getting-up does NOT read as one unbroken motion run:
+        // `motionAboveLocalFloor` is relative, so a long episode LIFTS ITS OWN rolling floor and the
+        // middle of it drops back under the cut. 🟢 measured on the grounding night — the ~57-minute
+        // desk trip arrives as runs of 3, 1, 5, 3, 2, 1 separated by 1–2 quiet epochs, so NO single
+        // run reaches a "sustained" bar of any useful size, while the CLUSTER spanning them plainly
+        // does. This is the same shape of fix `mainSleepBlock` applies with `maxSleepPause`: chain
+        // nearby fragments, then judge the chain.
+        let clusterGap = tuning.leadInMotionOnsetMinRun          // bridge gaps up to the same scale
+        var lastEnd: Int?
+        var i = 0
+        while i < reach {
+            guard motionAwake[i] else { i += 1; continue }
+            // Extend across short quiet gaps to get the whole episode.
+            var end = i
+            var k = i
+            while k < n {
+                if motionAwake[k] { end = k; k += 1; continue }
+                var gap = k
+                while gap < n, !motionAwake[gap] { gap += 1 }
+                if gap - k <= clusterGap, gap < n { k = gap } else { break }
+            }
+            if end - i + 1 >= tuning.leadInMotionOnsetMinRun { lastEnd = end }   // (b) + (d)
+            i = max(end + 1, i + 1)
+        }
+        guard let end = lastEnd, end + 1 < n else { return }
+
+        var candidate = awake
+        for k in 0 ... end where !candidate[k] { candidate[k] = true }        // (e) — only ever adds
+        guard candidate != awake else { return }
+        guard sleepSpan(candidate, sustain: tuning.minConsolidatedSleepEpochs) != nil else { return }  // (f)
+        awake = candidate
     }
 
     /// The offset margin for a night, DERIVED from its own sleeping-HR spread rather than fixed in

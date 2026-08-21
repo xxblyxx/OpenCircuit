@@ -252,6 +252,18 @@ source of truth for this table going forward — update both together if this is
 > two edges) closes that gap. **Re-sweep `arousalIntensityCut` once the edge fix is confirmed
 > on-device** — the 200 above was chosen against a night whose onset is about to change by ~70
 > minutes, and every count in the table is downstream of that window.
+>
+> **The same warning applies again as of `fix/sleep-onset-late-start` (2026-08-21).**
+> `markLeadInMotionOnset` (`SleepStaging.swift`, `Tuning.leadInMotionOnsetMinRun`) can push onset
+> LATER by hours on a night where the wearer got up in the middle of a long lead-in — 🟢 measured
+> 2026-08-20/21, onset 22:11 → 00:41, a **150-minute** move. That is a different failure mode from
+> `markEdgeMotionAwake`'s (that one moved onset by ~70 min); this one moves a WRONGLY-early onset
+> later by however long the wearer was actually up. Any night this pass fires on invalidates
+> `arousalIntensityCut`'s fitting window the same way the edge fix did, and by a larger margin.
+> See `docs/PENDING_VALIDATION.md` → `lead-in-motion-onset-refit`.
+>
+> (A same-day first attempt, `markLeadInVitalsAwake` / `Tuning.leadInVitalsAwakeRatio`, is 🔴 refuted
+> and ships disabled — it is not in this path. `lead-in-vitals-ratio-refit` under `## Settled`.)
 
 ## 5. Acceptance criteria
 
