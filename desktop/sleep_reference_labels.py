@@ -660,6 +660,40 @@ def sweep_edge_cut(labels, store_path, archives, tz, cuts):
             print(row)
 
 
+# --------------------------------------------------------------------------- --onset-error
+#
+# The instrument `Tuning.leadInVitalsAwakeRatio` (SleepStaging.swift) is validated against: reports
+# OUR ALREADY-STAGED onset/finalWake (from the pulled SwiftData store, exactly what shipped -- no
+# re-simulation like sweep_arousal_cut/sweep_edge_cut) against each reference source's own
+# asleep-labelled onset/finalWake, per stored night. This is retrospective only: the raw epoch
+# archive retains ~30h, so it can't be re-swept across older nights the way the two sweeps above
+# can when their inputs are still banked -- but `ZSTOREDSLEEPSUMMARY` (and therefore this report)
+# reaches back as far as the store itself does.
+
+def onset_error(labels, store_path, tz):
+    bounds = load_own_night_bounds(store_path)
+    if not bounds:
+        print("\nno stored nights to report")
+        return
+    sources = sorted({src for src, s, e, st in labels})
+    print(f"\n--- onset/final-wake error vs. reference labels (per stored night) ---")
+    for in_bed_start, in_bed_end, our_onset, our_final_wake in bounds:
+        print(f"\nnight {fmt(in_bed_start, tz)} .. {fmt(in_bed_end, tz)}")
+        if our_onset is None:
+            print("  no asleep segments stored -- skipping")
+            continue
+        print(f"  our stored onset/finalWake: {fmt(our_onset, tz)} .. {fmt(our_final_wake, tz)}")
+        for src in sources:
+            src_asleep = [(s, e) for s2, s, e, st in labels
+                         if s2 == src and st in ("light", "deep", "rem")
+                         and s < in_bed_end and e > in_bed_start]
+            if not src_asleep:
+                continue
+            ref_onset, ref_wake = min(s for s, e in src_asleep), max(e for s, e in src_asleep)
+            print(f"    {src:<24}onset {fmt(ref_onset, tz)} ({(our_onset - ref_onset) / 60:+.1f}m)"
+                  f"   wake {fmt(ref_wake, tz)} ({(our_final_wake - ref_wake) / 60:+.1f}m)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -690,6 +724,10 @@ def main():
                          "(minutes) each cut would produce, against a reference source's own "
                          "labelled onset/wake. Bare flag uses the default sweep: "
                          "345,300,250,200,150,100,50")
+    ap.add_argument("--onset-error", action="store_true",
+                    help="validates Tuning.leadInVitalsAwakeRatio (docs/PENDING_VALIDATION.md -> "
+                         "lead-in-vitals-ratio-refit): our ALREADY-STAGED onset/final-wake per "
+                         "stored night against each reference source's own labelled onset/wake")
     ap.add_argument("--source", help="restrict to one source name (e.g. WHOOP)")
     args = ap.parse_args()
 
@@ -728,6 +766,9 @@ def main():
         cuts = ([int(c.strip()) for c in args.sweep_edge_cut.split(",")] if args.sweep_edge_cut
                 else [345, 300, 250, 200, 150, 100, 50])
         sweep_edge_cut(labels, args.dir / STORE_NAME, load_archives(prefs), tz, cuts)
+
+    if args.onset_error:
+        onset_error(labels, args.dir / STORE_NAME, tz)
 
     if not labels:
         return

@@ -554,6 +554,96 @@ final class SleepStagingTests: XCTestCase {
         XCTAssertFalse(awake.isEmpty, "the early awakening still surfaces as an interior awake segment")
     }
 
+    // MARK: - Lead-in vitals-density onset (the "quiet-awake-on-a-phone" fix, 2026-08-20/21)
+
+    /// Reproduces the grounding night: ~95 min at rest (HR flat, low, motion at floor) with SPARSE
+    /// sleep-vitals coverage (the wearer awake, so the ring's optical read is dirtier / less frequent),
+    /// followed by real sleep with DENSE sleep-vitals coverage. Neither HR (both stretches sit near the
+    /// floor) nor motion (both still) can see the difference — this is the bug this pass exists for.
+    /// `leadInEpochs` should be a multiple of `onsetSustainEpochs` (6, the default block size this
+    /// pass scans in) so the lead-in's vitals pattern lands on a clean block boundary — otherwise a
+    /// partial trailing block can alias to a different density than the rest of the lead-in.
+    private func quietAwakeThenRealSleep(leadInVitalsEveryN: Int, sleepVitalsEveryN: Int,
+                                         leadInEpochs: Int = 36, sleepEpochs: Int = 100)
+        -> (recs: [BulkRecord], onset: UInt32) {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }             // before bed (outside block)
+        for i in 0..<leadInEpochs {                                     // ~95 min quietly awake (HR 54-73 measured)
+            recs.append(vrec(c, hr: 60, hrv: i % leadInVitalsEveryN == 0 ? 55 : 0)); c += step
+        }
+        let onset = c
+        for i in 0..<sleepEpochs {                                      // real sleep: HR settles, vitals dense
+            recs.append(vrec(c, hr: 52, hrv: i % sleepVitalsEveryN == 0 ? 55 : 0)); c += step
+        }
+        for _ in 0..<8 { recs.append(arec(c)); c += step }              // morning
+        return (recs, onset)
+    }
+
+    /// THE FIX: with the pass enabled, onset is pushed past the quiet-awake lead-in (sparse vitals)
+    /// to where real sleep (dense vitals) actually begins — even though HR alone never distinguishes
+    /// the two stretches (both sit at/near the sleeping floor throughout).
+    func testLeadInVitalsDensityPushesOnsetPastAQuietAwakeStretch() {
+        // 1-in-6 (not 1-in-5): aligned to `onsetSustainEpochs`'s 6-epoch scan block so every block
+        // of the lead-in has the SAME density (1/6 ≈ 0.167) — a 1-in-5 pattern aliases against a
+        // 6-wide block boundary and lands some blocks at 2/6, which is a block-scan quantization
+        // artifact of the TEST fixture, not a real failure mode (a real night's HRV emission isn't
+        // periodic), so the fixture avoids it rather than the pass working around it.
+        let (recs, onset) = quietAwakeThenRealSleep(leadInVitalsEveryN: 6, sleepVitalsEveryN: 2)
+        let tuning = SleepStaging.Tuning(leadInVitalsAwakeRatio: 0.6)
+        let segs = SleepStaging.classify(from: recs, tuning: tuning)
+        guard let win = SleepStaging.sleepWindow(segs) else { return XCTFail("no sleep window") }
+        let onsetDate = Date(timeIntervalSince1970: Double(Int(onset) + Command.syncEpoch))
+        XCTAssertEqual(win.onset.timeIntervalSince(onsetDate), 0, accuracy: Double(step) * 3,
+                      "onset lands where sleep-vitals density picks up, not at the sparse-vitals lead-in")
+    }
+
+    /// Locks the shipped default (0.6, 🟡 fitted on one grounding night — see the field's doc comment
+    /// and `docs/PENDING_VALIDATION.md` → `lead-in-vitals-ratio-refit`). Guards against an unnoticed
+    /// rollback, the same role `testQuietWakeOnsetCalibration` plays for `onsetSettleFraction`.
+    func testLeadInVitalsRatioDefaultIsShippedAtPointSix() {
+        XCTAssertEqual(SleepStaging.Tuning.default.leadInVitalsAwakeRatio, 0.6)
+    }
+
+    /// SAFETY — `0` truly disables the pass: passing it explicitly must be byte-identical to a night
+    /// with no vitals-density gap at all (the uniform-density fixture below), proving `0` is a real
+    /// escape hatch and not just "a very strict cutoff".
+    func testLeadInVitalsDensityRatioZeroDisablesThePass() {
+        let (recs, _) = quietAwakeThenRealSleep(leadInVitalsEveryN: 6, sleepVitalsEveryN: 2)
+        let off = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0))
+        let uniform = quietAwakeThenRealSleep(leadInVitalsEveryN: 2, sleepVitalsEveryN: 2).recs
+        let uniformOff = SleepStaging.classify(from: uniform, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0))
+        // Not a direct equality (the two nights have different vitals bytes) — the properties that
+        // must match are onset and total asleep, since `0` means the pass never looks at vitals at all.
+        XCTAssertEqual(SleepStaging.sleepWindow(off)?.onset, SleepStaging.sleepWindow(uniformOff)?.onset,
+                       "ratio 0 ignores vitals density entirely — a real density gap changes nothing")
+    }
+
+    /// SAFETY — a night with UNIFORM sleep-vitals density (no real awake/asleep density gap) must be
+    /// left untouched: the pass only fires on a MATERIAL density gap, so an ordinary night's onset isn't
+    /// disturbed by noise in when the ring happens to emit sleep-vitals.
+    func testLeadInVitalsDensityUntouchedWhenDensityIsUniform() {
+        let (recs, _) = quietAwakeThenRealSleep(leadInVitalsEveryN: 2, sleepVitalsEveryN: 2)
+        let on = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0.6))
+        let off = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0))
+        XCTAssertEqual(on, off, "uniform vitals density (no real gap) → pass is inert, output identical")
+    }
+
+    /// SAFETY — a night with NO sleep-vitals coverage anywhere (rings that never emit HRV, or a stretch
+    /// with zero HRV samples) must be untouched: absence of data is not evidence of wake, matching every
+    /// other vitals-gated pass in this file.
+    func testLeadInVitalsDensityNoOpWithoutAnyVitalsCoverage() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        for _ in 0..<38 { recs.append(vrec(c, hr: 60, hrv: 0)); c += step }
+        for _ in 0..<100 { recs.append(vrec(c, hr: 52, hrv: 0)); c += step }
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        let on = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0.6))
+        let off = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0))
+        XCTAssertEqual(on, off, "no vitals coverage anywhere → nothing to judge against, pass is inert")
+    }
+
     // MARK: - Constructed-night partition (sanity vs. RingConn night totals)
 
     func testConstructedNightPartitionsLikeATracker() {

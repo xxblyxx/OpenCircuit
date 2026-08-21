@@ -206,6 +206,38 @@ there is no denominator.
 
 ---
 
+- id: lead-in-vitals-ratio-refit
+- shipped: `leadInVitalsAwakeRatio = 0.6` is LIVE (`SleepStaging.Tuning`, `markLeadInVitalsAwake`,
+  fix/sleep-onset-late-start). New leading-edge onset pass: compares the sleep-vitals (HRV) epoch
+  DENSITY of the leading candidate sleep run against the density past the onset search window,
+  re-marking the candidate awake when its density is thin relative to confirmed sleep — catches a
+  wearer quietly awake at resting HR (a phone, reading) that neither the HR gate nor motion gate
+  can see, since both channels read identically to real sleep during that stretch.
+- claim: 0.6 is fitted on exactly ONE grounding night (2026-08-20/21: quiet-awake density 21% vs.
+  confirmed-asleep density 50%, ratio 0.42 — well clear of 0.6). This repo has shipped an
+  onset/interior constant this way before and had it refuted on the very next captured night
+  (`sleep-arousal-cut-refit` above, `arousalIntensityCut`) — do not treat 0.6 as validated until it
+  holds across more nights than the one it was fit on.
+- needs: nights with BOTH a Watch/NOOP/WHOOP asleep label (Diagnostics → "Import reference sleep
+  labels") AND the ring's own staged summary in `ZSTOREDSLEEPSUMMARY` — no raw-epoch retention
+  constraint here, unlike the two arousal/edge sweeps above: `--onset-error` reads the ALREADY-
+  STAGED stored onset, not a re-simulation from raw epochs, so it can check as many past nights as
+  the store holds, not just the newest ~30h.
+- blocked-because: only one grounding night exists so far; the pass needs to run against several
+  more real nights (including at least one more with a genuine long quiet-awake-in-bed lead-in) for
+  the fit to mean anything more than "worked on the night it was built from."
+- check: `desktop/sleep_reference_labels.py --pull --onset-error`
+- passes-if: across every night with a reference onset label, median |onset error| ≤ 20 min, no
+  single night worse than 30 min, and no night where onset moves EARLIER than the reference by
+  more than 15 min (the pass only ever pushes onset later, so an earlier-than-reference result
+  would mean it fired and still undershot — a different failure mode worth flagging on its own).
+  Falling short → do not re-fit blindly; check whether the underlying idea (vitals density as a
+  discriminator) holds at all before touching the constant, the same way `sleep-arousal-cut-refit`
+  redirects to a per-night adaptive approach rather than re-guessing a new global number.
+- check-after: 2026-08-28
+
+---
+
 ## Settled
 
 ### §1b's fix works; arousalIntensityCut = 200 does NOT generalize — 2026-08-18

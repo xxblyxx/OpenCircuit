@@ -240,3 +240,23 @@ a high-blast-radius knob with no metric to detect a regression.
 
 Tracked in `docs/PENDING_VALIDATION.md` as `sleep-reference-label-corpus` and
 `sleep-tail-encodes-arousal`.
+
+## 11. A related but distinct bug: the chart drew the in-bed envelope, not the sleep window
+
+Everything above is about *interior* awakenings the classifier misses entirely. A separate bug,
+found 2026-08-21 (`fix/sleep-onset-late-start`), is about the RENDERER showing correctly-detected
+pre-sleep time as if it were sleep: `SleepStagesSection.domain` (the hypnogram's x-axis bounds) took
+`min(start)/max(end)` over ALL segments, including the full-span `.inBed` envelope — so the chart
+always started at bedtime, not at sleep onset, even on a night where onset was detected correctly.
+No option above addresses this; it was never proposed anywhere in this document because it's a
+display bug, not a detection gap. Fixed by anchoring `domain.start` on `SleepStaging.sleepWindow(_:)`
+with a bounded 30-min lead-in (so a badly-wrong onset stays visible as an anomaly rather than
+disappearing off-chart). See the `fix/sleep-onset-late-start` branch.
+
+That same investigation also found a genuine ONSET-DETECTION miss the classifier had not covered:
+a wearer quietly awake at resting HR (phone, reading) for an extended stretch is indistinguishable
+from real sleep on motion + HR alone — neither channel this document discusses moves. The fix
+(`markLeadInVitalsAwake`, `Tuning.leadInVitalsAwakeRatio`) uses sleep-vitals (HRV) epoch density
+instead, the same signal `sleepVitalsRescue`/`rescueSecondBoutHRWake` already trust elsewhere in
+this file's codebase, mirrored to the leading edge. See `docs/SLEEP_INTERIOR_AROUSALS.md`'s §4
+warning (updated) and `docs/PENDING_VALIDATION.md` → `lead-in-vitals-ratio-refit`.

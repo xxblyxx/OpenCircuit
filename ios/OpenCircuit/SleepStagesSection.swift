@@ -53,9 +53,26 @@ struct SleepStagesSection: View {
 
     private static let movementEpochSeconds: TimeInterval = 150 // BulkRecord.epochSeconds
 
+    /// How far before sleep onset the chart is allowed to draw, so a long awake-in-bed lead-in
+    /// (phone, desk work, surfing) doesn't drag the whole night onto the x-axis the way the raw
+    /// `.inBed` envelope used to (#XXX). Bounded rather than clipped flush to onset: an onset the
+    /// classifier got badly wrong is still visible as an anomalous lead-in instead of disappearing
+    /// off-chart, which is exactly the failure mode this change is about.
+    private static let onsetLeadIn: TimeInterval = 30 * 60
+
     private var domain: (start: Date, end: Date)? {
-        guard let start = segments.map(\.start).min(),
-              let end = segments.map(\.end).max(), end > start else { return nil }
+        guard let inBedStart = segments.map(\.start).min(),
+              let end = segments.map(\.end).max(), end > inBedStart else { return nil }
+        // Anchor on sleep onset, not the in-bed envelope — a night with a long pre-sleep lead-in
+        // should not draw that lead-in as if it were part of the sleep window (docs/SLEEP_AWAKE_RESOLUTION.md).
+        // Falls back to the in-bed start when nothing is asleep yet (a live-staged night with no
+        // asleep segment must still draw something).
+        let start: Date
+        if let onset = SleepStaging.sleepWindow(segments)?.onset {
+            start = max(inBedStart, onset.addingTimeInterval(-Self.onsetLeadIn))
+        } else {
+            start = inBedStart
+        }
         return (start, end)
     }
 
