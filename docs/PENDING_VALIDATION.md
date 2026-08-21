@@ -206,39 +206,62 @@ there is no denominator.
 
 ---
 
-- id: lead-in-vitals-ratio-refit
-- shipped: `leadInVitalsAwakeRatio = 0.6` is LIVE (`SleepStaging.Tuning`, `markLeadInVitalsAwake`,
-  fix/sleep-onset-late-start). New leading-edge onset pass: compares the sleep-vitals (HRV) epoch
-  DENSITY of the leading candidate sleep run against the density past the onset search window,
-  re-marking the candidate awake when its density is thin relative to confirmed sleep — catches a
-  wearer quietly awake at resting HR (a phone, reading) that neither the HR gate nor motion gate
-  can see, since both channels read identically to real sleep during that stretch.
-- claim: 0.6 is fitted on exactly ONE grounding night (2026-08-20/21: quiet-awake density 21% vs.
-  confirmed-asleep density 50%, ratio 0.42 — well clear of 0.6). This repo has shipped an
-  onset/interior constant this way before and had it refuted on the very next captured night
-  (`sleep-arousal-cut-refit` above, `arousalIntensityCut`) — do not treat 0.6 as validated until it
-  holds across more nights than the one it was fit on.
+- id: lead-in-motion-onset-refit
+- shipped: `leadInMotionOnsetMinRun = 6` is LIVE (`SleepStaging.Tuning`, `markLeadInMotionOnset`,
+  plus `onsetSearchReach`), fix/sleep-onset-late-start, 2026-08-21. Leading-edge onset pass keyed on
+  the DE-FLOORED MOTION channel: onset anchors after the last sustained motion episode in the
+  leading region — "sleep starts when the moving stops". Replaces the same-day
+  `leadInVitalsAwakeRatio` attempt (refuted, see `## Settled`).
+- claim: three things were fitted on ONE night (2026-08-20/21) and none has a second data point yet:
+  (a) `leadInMotionOnsetMinRun = 6` epochs (15 min) as the line between a mid-night STIR and getting
+  up — measured 3 epochs (~7.5 min) vs 23 (~57 min) on that night; (b) clustering fragments across
+  gaps of the same size, needed because a sustained episode lifts its own rolling floor and arrives
+  as runs of 3,1,5,3,2,1; (c) `onsetSearchReach` = half the block for THIS pass only. The night it
+  was fitted on gives onset 00:41:36 against NOOP 00:48:55 and Apple Watch 00:59:29.
 - needs: nights with BOTH a Watch/NOOP/WHOOP asleep label (Diagnostics → "Import reference sleep
-  labels") AND the ring's own staged summary in `ZSTOREDSLEEPSUMMARY` — no raw-epoch retention
-  constraint here, unlike the two arousal/edge sweeps above: `--onset-error` reads the ALREADY-
-  STAGED stored onset, not a re-simulation from raw epochs, so it can check as many past nights as
-  the store holds, not just the newest ~30h.
-- blocked-because: only one grounding night exists so far; the pass needs to run against several
-  more real nights (including at least one more with a genuine long quiet-awake-in-bed lead-in) for
-  the fit to mean anything more than "worked on the night it was built from."
+  labels") AND the ring's own staged summary in `ZSTOREDSLEEPSUMMARY`. No raw-epoch retention
+  constraint: `--onset-error` reads the ALREADY-STAGED stored onset, not a re-simulation, so it
+  checks as many past nights as the store holds. **At least one more night with a genuine
+  got-up-in-the-middle lead-in is what actually tests this** — an ordinary night only confirms the
+  pass stays inert.
+- blocked-because: one grounding night. The ~30 h archive means no older night can be replayed
+  through the new code, so the corpus can only be built forward — same constraint as
+  `sleep-arousal-cut-refit`.
 - check: `desktop/sleep_reference_labels.py --pull --onset-error`
 - passes-if: across every night with a reference onset label, median |onset error| ≤ 20 min, no
-  single night worse than 30 min, and no night where onset moves EARLIER than the reference by
-  more than 15 min (the pass only ever pushes onset later, so an earlier-than-reference result
-  would mean it fired and still undershot — a different failure mode worth flagging on its own).
-  Falling short → do not re-fit blindly; check whether the underlying idea (vitals density as a
-  discriminator) holds at all before touching the constant, the same way `sleep-arousal-cut-refit`
-  redirects to a per-night adaptive approach rather than re-guessing a new global number.
+  single night worse than 30 min, and no night where the pass fires and pushes onset LATER than the
+  reference by more than 20 min (over-firing — declaring sleep started after it really did — is the
+  failure mode this pass can newly cause, and it costs real sleep time).
+  Falling short → do not re-fit the constant blindly. Check first WHICH of (a)/(b)/(c) moved: the
+  duration bar, the clustering gap, and the reach are independent, and the honest answer may be that
+  motion-run length is not a stable discriminator either, the way vitals density was not.
 - check-after: 2026-08-28
 
 ---
 
 ## Settled
+
+### Sleep-vitals DENSITY does not locate onset — refuted the same day it shipped, 2026-08-21
+- id: lead-in-vitals-ratio-refit
+- was: `leadInVitalsAwakeRatio = 0.6` (`markLeadInVitalsAwake`) shipped that morning on the theory
+  that the ring emits sleep-vitals (HRV) epochs more often once the wearer is actually asleep, so a
+  thin-density leading run marks quiet wakefulness that HR and motion both read as sleep. Grounding
+  measurement: 21% density across the quiet-awake stretch vs 50% once asleep.
+- observed: REFUTED by replaying the very night it was fitted on through the real epoch archive
+  (`SleepStaging.classify`, not a simulation). It moves onset 22:11 → **22:41**, against a real
+  onset of ~00:48 — it recovers 30 min of a ~2.5 h error. The aggregate density gap is real, but
+  the pass scans 6-epoch blocks and stops at the first one that is not thin, and the ring's HRV
+  emission is irregular enough that a block inside the quiet-awake stretch reads 0.333 against a
+  0.283 cutoff. Widening the search horizon to 63, 72, or 96 epochs yields **22:41 in every case**,
+  which is what proves the stop rule — not the horizon — is what binds.
+- disposition: default set to `0` (disabled). The pass and its tests are KEPT, as a documented kill
+  switch and as the record of a refuted approach — same discipline as `arousalIntensityCut` below.
+  Superseded by `markLeadInMotionOnset` (`lead-in-motion-onset-refit`, still open), which reads the
+  de-floored MOTION channel: on the same night that channel is silent for 175 consecutive epochs of
+  real sleep and clearly active across the getting-up, and it lands onset at 00:41:36.
+- lesson, and it is the same one twice now: a signal that separates two stretches IN AGGREGATE does
+  not necessarily separate them WINDOW BY WINDOW, which is what a scanning pass actually needs.
+  Check the per-window distribution before fitting a threshold to a difference of means.
 
 ### §1b's fix works; arousalIntensityCut = 200 does NOT generalize — 2026-08-18
 - id: sleep-arousal-cut-single-night-fit

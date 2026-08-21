@@ -142,4 +142,51 @@ final class CaptureToStoreEndToEndTests: XCTestCase {
 
         XCTAssertEqual(try store.latestSleepSummary()?.asleepMin, 380)
     }
+
+    /// 🟢 REGRESSION, measured 2026-08-21. The onset fix staged correctly on-device and was then
+    /// THROWN AWAY on every drain — `obs.metricLog` recorded
+    /// `sleep-persist: outcome=keptFullerStoredNight wroteRow=false` repeatedly while the corrected
+    /// hypnogram sat unused in `sleep.pendingStagedSegments`.
+    ///
+    /// Cause: `sameCoverage` required BOTH in-bed boundaries within one 150 s epoch. The ring keeps
+    /// streaming epochs after the morning sync, so a later re-stage legitimately sees the block END a
+    /// few epochs further on — measured start delta 0 s, END DELTA 450 s. `sameCoverage` went false,
+    /// the merge fell through to the asleep-completeness test, and the corrected night — which has
+    /// LESS asleep time precisely BECAUSE the onset fix works — was rejected as a thin fragment.
+    ///
+    /// The trailing bound is therefore wider than the leading one. The start bound stays strict, which
+    /// is what `testThinnerReStageDoesNotClobberFullerStoredNight` above still pins.
+    func testTrailingEdgeDriftStillCountsAsSameCoverage() throws {
+        let store = try makeStore()
+        let night = Date(timeIntervalSince1970: 1_750_000_000)
+        let end = night.addingTimeInterval(8 * 3600)
+
+        try store.saveSleepSummary(summary(inBedMin: 480, asleepMin: 470),
+                                   night: night, inBedStart: night, inBedEnd: end)
+        // Same night, same start, end drifted by 7.5 min (3x one epoch) — a re-stage, not a fragment.
+        let drifted = end.addingTimeInterval(450)
+        try store.saveSleepSummary(summary(inBedMin: 487, asleepMin: 380),
+                                   night: night, inBedStart: night, inBedEnd: drifted)
+
+        XCTAssertEqual(try store.latestSleepSummary()?.asleepMin, 380,
+                       "a re-stage whose trailing edge drifted must still be able to correct onset")
+    }
+
+    /// The guard on the above: widening the TRAILING tolerance must not let a genuinely different
+    /// (leading-shifted) window through. A fragment that starts somewhere else is still refused.
+    func testLeadingEdgeShiftIsNotTreatedAsSameCoverage() throws {
+        let store = try makeStore()
+        let night = Date(timeIntervalSince1970: 1_750_000_000)
+        let end = night.addingTimeInterval(8 * 3600)
+
+        try store.saveSleepSummary(summary(inBedMin: 480, asleepMin: 470),
+                                   night: night, inBedStart: night, inBedEnd: end)
+        // Starts 30 min later: a different coverage window, and thinner. Must NOT replace.
+        try store.saveSleepSummary(summary(inBedMin: 450, asleepMin: 380),
+                                   night: night, inBedStart: night.addingTimeInterval(1800),
+                                   inBedEnd: end)
+
+        XCTAssertEqual(try store.latestSleepSummary()?.asleepMin, 470,
+                       "a leading-shifted, thinner window is a fragment — the fuller night stands")
+    }
 }

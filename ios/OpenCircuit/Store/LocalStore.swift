@@ -1534,12 +1534,33 @@ struct LocalStore {
             let newSpan = inBedEnd > inBedStart ? inBedEnd.timeIntervalSince(inBedStart) : 0
             // A classifier refinement can legitimately turn formerly-asleep quiet wake into
             // awake-in-bed while using the exact same archived coverage. Treat matching boundaries
-            // (within one ring epoch) as a reclassification, not as a thinner fragment; otherwise the
-            // old, larger asleep total would be merge-protected forever after an onset fix ships.
+            // as a reclassification, not as a thinner fragment; otherwise the old, larger asleep
+            // total would be merge-protected forever after an onset fix ships.
+            //
+            // ASYMMETRIC TOLERANCES, and the asymmetry is the point (🟢 measured 2026-08-21):
+            //
+            //   • START keeps the strict one-epoch bound. It is the ONSET-side anchor, and it is what
+            //     tells a re-stage of THIS night apart from a different night or a disjoint fragment.
+            //     A fragment that genuinely starts elsewhere must NOT be waved through.
+            //   • END gets a wider bound, because the trailing edge legitimately drifts between
+            //     re-stages for reasons that have nothing to do with the classifier: the ring keeps
+            //     streaming epochs after the morning sync, so a later drain sees the block end a few
+            //     epochs further on. MEASURED on the 2026-08-20/21 night: start delta 0 s, end delta
+            //     450 s — 3x `epochTolerance`. `sameCoverage` therefore went false, the merge fell
+            //     through to the asleep-completeness test, and the corrected night (which has LESS
+            //     asleep time BY DESIGN — that is the onset fix working) was discarded as a thin
+            //     fragment. `obs.metricLog` recorded it on every drain:
+            //     `sleep-persist: outcome=keptFullerStoredNight wroteRow=false`.
+            //
+            // This does NOT weaken the fragment protection: a real partial drain is short at the
+            // START (it is missing the beginning of the night), which the strict start bound still
+            // catches, and the asleep-completeness test below still governs everything that is not
+            // same-coverage.
             let epochTolerance = TimeInterval(BulkRecord.epochSeconds)
+            let trailingDriftTolerance: TimeInterval = 10 * 60
             let sameCoverage = storedSpan > 0 && newSpan > 0
                 && abs(existing.inBedStart.timeIntervalSince(inBedStart)) <= epochTolerance
-                && abs(existing.inBedEnd.timeIntervalSince(inBedEnd)) <= epochTolerance
+                && abs(existing.inBedEnd.timeIntervalSince(inBedEnd)) <= trailingDriftTolerance
             // Completeness is judged on time ASLEEP (span is a fallback): a later, shorter slice — or a
             // wide window padded with awake — can't shrink a fuller night. See SleepSummaryMerge.
             guard SleepSummaryMerge.shouldReplace(

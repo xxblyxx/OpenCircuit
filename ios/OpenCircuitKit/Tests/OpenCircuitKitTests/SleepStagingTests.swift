@@ -598,11 +598,13 @@ final class SleepStagingTests: XCTestCase {
                       "onset lands where sleep-vitals density picks up, not at the sparse-vitals lead-in")
     }
 
-    /// Locks the shipped default (0.6, 🟡 fitted on one grounding night — see the field's doc comment
-    /// and `docs/PENDING_VALIDATION.md` → `lead-in-vitals-ratio-refit`). Guards against an unnoticed
-    /// rollback, the same role `testQuietWakeOnsetCalibration` plays for `onsetSettleFraction`.
-    func testLeadInVitalsRatioDefaultIsShippedAtPointSix() {
-        XCTAssertEqual(SleepStaging.Tuning.default.leadInVitalsAwakeRatio, 0.6)
+    /// Locks the vitals-density pass OFF (🔴 refuted 2026-08-21 by replaying the very night it was
+    /// fitted on: it reaches 22:41 against a real 00:48, and widening the horizon does not help
+    /// because the stop-on-first-non-thin-block rule is what binds). Superseded by the motion-onset
+    /// pass below. Guards against an unnoticed re-enable; see the field's doc comment and
+    /// `docs/PENDING_VALIDATION.md` → `lead-in-vitals-ratio-refit`.
+    func testLeadInVitalsRatioShipsDisabled() {
+        XCTAssertEqual(SleepStaging.Tuning.default.leadInVitalsAwakeRatio, 0)
     }
 
     /// SAFETY — `0` truly disables the pass: passing it explicitly must be byte-identical to a night
@@ -642,6 +644,187 @@ final class SleepStagingTests: XCTestCase {
         let on = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0.6))
         let off = SleepStaging.classify(from: recs, tuning: SleepStaging.Tuning(leadInVitalsAwakeRatio: 0))
         XCTAssertEqual(on, off, "no vitals coverage anywhere → nothing to judge against, pass is inert")
+    }
+
+    // MARK: - Lead-in MOTION onset (the "got up and did something" fix, 2026-08-20/21)
+
+    /// Reproduces the shape of the grounding night, which no HR- or vitals-based pass can solve:
+    /// ~90 min lying STILL and awake at resting HR (a phone), then ~55 min of real MOVEMENT (got up,
+    /// worked at a computer), then real sleep. HR never separates the first stretch from the third —
+    /// both sit at the sleeping floor — so onset must be anchored by where the MOVING stopped.
+    /// The getting-up stretch is deliberately INTERMITTENT (moving epochs interleaved with brief still
+    /// ones), matching the measured night: 🟢 on 2026-08-20/21 the desk trip read 91, 186, 76, 0, 0, 27,
+    /// 14, 0, 36 … de-floored — a person at a computer is not in continuous motion. It also has to be
+    /// this way for the fixture to be honest: a solid block of identical high motion lifts the rolling
+    /// idle floor to its own level (`motionAboveLocalFloor` is RELATIVE by design, so a constant is
+    /// always "still"), and a long enough solid block additionally splits the night in
+    /// `mainSleepBlock`, so the staged night would no longer contain the lead-in at all.
+    private func stillThenUpThenAsleep(motionEpochs: Int = 22) -> (recs: [BulkRecord], onset: UInt32) {
+        var recs: [BulkRecord] = []
+        // Anchored to a REAL overnight wall clock (21:40 local), not the arbitrary counter the older
+        // fixtures use: `BulkSleep.latestNightRecords` applies an overnight-window rule, and a night
+        // whose synthetic timestamps land in the afternoon gets scoped to the wrong block — which
+        // silently removes the lead-in this fixture exists to exercise.
+        var c: UInt32 = 209_493_600                                     // 2026-08-20 21:40:00 local
+        for _ in 0..<8 { recs.append(arec(c)); c += step }              // before bed (outside block)
+        for _ in 0..<36 { recs.append(vrec(c, hr: 60, hrv: 55)); c += step }   // still + AWAKE on a phone
+        for i in 0..<motionEpochs {                                     // UP: real, intermittent movement
+            // 4 moving : 1 still. The moving stretches must exceed `leadInMotionOnsetMinRun` (3) —
+            // a 2:1 interleave yields only 2-epoch runs, which the pass correctly rejects as stirs.
+            // The measured night has runs of this length (e.g. 91, 186, 76 consecutive).
+            if i % 5 == 4 { recs.append(vrec(c, hr: 62, hrv: 0, motion: 1)) }   // a beat of stillness
+            else          { recs.append(arec(c, motion: 90)) }
+            c += step
+        }
+        let onset = c
+        for _ in 0..<120 { recs.append(vrec(c, hr: 52, hrv: 60)); c += step }  // actually asleep
+        for _ in 0..<8 { recs.append(arec(c)); c += step }              // morning
+        return (recs, onset)
+    }
+
+    /// THE FIX: onset anchors after the last sustained motion run, NOT at the first quiet epoch of the
+    /// still-but-awake lead-in — even though HR is identical in both stretches.
+    func testLeadInMotionOnsetAnchorsAfterTheWearerStopsMoving() {
+        let (recs, onset) = stillThenUpThenAsleep()
+        let segs = SleepStaging.classify(from: recs)
+        guard let win = SleepStaging.sleepWindow(segs) else { return XCTFail("no sleep window") }
+        let onsetDate = Date(timeIntervalSince1970: Double(Int(onset) + Command.syncEpoch))
+        XCTAssertEqual(win.onset.timeIntervalSince(onsetDate), 0, accuracy: Double(step) * 3,
+                       "onset lands where the moving stopped, not at the still-but-awake lead-in")
+    }
+
+    /// Drives the pass DIRECTLY on an awake mask, the way `markPointOfNoReturnOffset` and
+    /// `erodeShortHRWake` are tested and for the same stated reason: on a SYNTHETIC night some other
+    /// pass always reaches the answer first (a fabricated `arec` has a clean `[15:20]` tail, so
+    /// `markEdgeMotionAwake` resolves a lead-in that on the REAL ring is buried in tail noise), so an
+    /// end-to-end on/off comparison cannot isolate this pass's contribution. Its real-archive control
+    /// is recorded instead: 🟢 replaying the 2026-08-20/21 night through `SleepStaging.classify` gives
+    /// onset 00:41:36 with the pass on and 22:11:36 with `leadInMotionOnsetMinRun: 0`.
+    ///
+    /// Shape: a quiet head SHORTER than `minConsolidatedSleepEpochs` (so guard (d) reads "no real sleep
+    /// yet" — the pre-onset lie-awake), one sustained motion run, then sleep. Only the pass under test
+    /// can move onset here, because nothing in the mask itself says the head is awake.
+    func testLeadInMotionOnsetDrivenDirectlyAnchorsAfterTheLastSustainedRun() {
+        let n = 100
+        var awake = [Bool](repeating: false, count: n)          // nothing is awake a priori
+        var motion = [Bool](repeating: false, count: n)
+        let head = SleepStaging.Tuning.default.minConsolidatedSleepEpochs - 2   // not yet consolidated
+        for i in head..<(head + 6) { motion[i] = true }          // sustained: the getting-up
+        SleepStaging.markLeadInMotionOnsetForTesting(&awake, motionAwake: motion, tuning: .default)
+        XCTAssertTrue(awake[0..<(head + 6)].allSatisfy { $0 },
+                      "everything up to the end of the motion run is awake-in-bed")
+        XCTAssertTrue(awake[(head + 6)...].allSatisfy { !$0 },
+                      "sleep begins at the first still epoch after it — nothing later is touched")
+    }
+
+    /// Guard (d), driven directly: what separates a mid-night STIR from getting up is the DURATION of
+    /// the motion, not what precedes it. A short burst — however much sleep sits behind it — must not
+    /// re-anchor onset. (The "consolidated sleep behind it" guard used by the HR passes was tried here
+    /// and 🔴 fails on the real night, whose quiet-awake lead-in reads as asleep; see the pass's doc.)
+    func testLeadInMotionOnsetIgnoresAShortBurstHoweverLateItFalls() {
+        let n = 100
+        var awake = [Bool](repeating: false, count: n)
+        var motion = [Bool](repeating: false, count: n)
+        let minRun = SleepStaging.Tuning.default.leadInMotionOnsetMinRun
+        let start = SleepStaging.Tuning.default.minConsolidatedSleepEpochs + 4
+        for i in start..<(start + minRun - 1) { motion[i] = true }      // one epoch short of the bar
+        SleepStaging.markLeadInMotionOnsetForTesting(&awake, motionAwake: motion, tuning: .default)
+        XCTAssertTrue(awake.allSatisfy { !$0 },
+                      "a burst shorter than minRun is a stir — onset must not move")
+    }
+
+    /// The clustering that makes the duration bar meaningful on real data: a long getting-up arrives
+    /// FRAGMENTED, because `motionAboveLocalFloor` is relative and a sustained episode lifts its own
+    /// rolling floor. 🟢 measured — the grounding night's ~57-minute desk trip decomposes into runs of
+    /// 3, 1, 5, 3, 2, 1, so no single run clears a useful bar while the cluster obviously does.
+    func testLeadInMotionOnsetClustersFragmentedMotionIntoOneEpisode() {
+        let n = 120
+        var awake = [Bool](repeating: false, count: n)
+        var motion = [Bool](repeating: false, count: n)
+        // The measured fragmentation pattern, starting at epoch 10: runs of 3,1,5,3,2,1 with 1-2 gaps.
+        for i in [10, 11, 12, 15, 18, 19, 20, 21, 22, 25, 26, 27, 29, 30, 32] { motion[i] = true }
+        SleepStaging.markLeadInMotionOnsetForTesting(&awake, motionAwake: motion, tuning: .default)
+        XCTAssertTrue(awake[0...32].allSatisfy { $0 },
+                      "the fragmented episode is one getting-up — onset lands after its LAST fragment")
+        XCTAssertTrue(awake[33...].allSatisfy { !$0 }, "sleep after it is untouched")
+    }
+
+    /// The kill switch and the two run-length guards, driven directly for the same reason as above.
+    func testLeadInMotionOnsetDirectGuards() {
+        let n = 100
+        // (a) kill switch
+        var awake = [Bool](repeating: false, count: n)
+        var motion = [Bool](repeating: false, count: n); for i in 20..<26 { motion[i] = true }
+        let before = awake
+        SleepStaging.markLeadInMotionOnsetForTesting(&awake, motionAwake: motion,
+                                                     tuning: .init(leadInMotionOnsetMinRun: 0))
+        XCTAssertEqual(awake, before, "minRun 0 disables the pass entirely")
+        // (b) a run shorter than minRun is a stir, not getting up
+        awake = [Bool](repeating: false, count: n)
+        motion = [Bool](repeating: false, count: n); motion[20] = true; motion[21] = true
+        SleepStaging.markLeadInMotionOnsetForTesting(&awake, motionAwake: motion, tuning: .default)
+        XCTAssertTrue(awake.allSatisfy { !$0 }, "a 2-epoch stir must not re-anchor onset")
+        // (c) a run beginning OUTSIDE the leading reach cannot re-anchor onset
+        awake = [Bool](repeating: false, count: n)
+        motion = [Bool](repeating: false, count: n)
+        let reach = SleepStaging.onsetSearchReach(epochCount: n, tuning: .default)
+        for i in (reach + 2)..<(reach + 8) { motion[i] = true }
+        SleepStaging.markLeadInMotionOnsetForTesting(&awake, motionAwake: motion, tuning: .default)
+        XCTAssertTrue(awake.allSatisfy { !$0 },
+                      "a motion run past the leading reach is a mid-night event, not the onset")
+    }
+
+    /// SAFETY — a brief mid-night stir must NOT re-anchor onset. The pass is scoped to the LEADING
+    /// region and requires a SUSTAINED run, so a normal night (asleep early, one short 3 a.m. stir) is
+    /// untouched: onset stays at the first sleep, and the stir stays an interior awakening.
+    func testLeadInMotionOnsetLeavesAMidNightStirAlone() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        let onset = c
+        for _ in 0..<60 { recs.append(vrec(c, hr: 52, hrv: 60)); c += step }   // 2.5 h real sleep FIRST
+        for _ in 0..<2 { recs.append(arec(c, motion: 90)); c += step }         // brief stir (< minRun)
+        for _ in 0..<80 { recs.append(vrec(c, hr: 52, hrv: 60)); c += step }   // back to sleep
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        let segs = SleepStaging.classify(from: recs)
+        guard let win = SleepStaging.sleepWindow(segs) else { return XCTFail("no sleep window") }
+        let onsetDate = Date(timeIntervalSince1970: Double(Int(onset) + Command.syncEpoch))
+        XCTAssertEqual(win.onset.timeIntervalSince(onsetDate), 0, accuracy: Double(step) * 3,
+                       "a brief mid-night stir must not move onset — consolidated sleep precedes it")
+    }
+
+    /// SAFETY — the pass only ever moves onset LATER. A night that is already anchored correctly (asleep
+    /// almost immediately, no getting-up) must be byte-identical with the pass on vs. off.
+    func testLeadInMotionOnsetIsInertOnAStraightforwardNight() {
+        var recs: [BulkRecord] = []
+        var c: UInt32 = 0x0c220000
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        for _ in 0..<140 { recs.append(vrec(c, hr: 52, hrv: 60)); c += step }
+        for _ in 0..<8 { recs.append(arec(c)); c += step }
+        let on = SleepStaging.classify(from: recs)
+        let off = SleepStaging.classify(from: recs, tuning: .init(leadInMotionOnsetMinRun: 0))
+        XCTAssertEqual(on, off, "no getting-up episode → the pass is inert, output identical")
+    }
+
+    /// Locks the shipped default. `0` is the documented kill switch; 3 epochs (~7.5 min) is the
+    /// "sustained, not a stir" bar. See `docs/PENDING_VALIDATION.md` → `lead-in-motion-onset-refit`.
+    func testLeadInMotionOnsetMinRunDefault() {
+        XCTAssertEqual(SleepStaging.Tuning.default.leadInMotionOnsetMinRun, 6)
+    }
+
+    /// The derived reach is what makes a multi-hour lead-in REACHABLE at all: on the grounding night
+    /// the real onset sat at epoch 72 while the old fixed bound stopped at 48. It must never SHRINK
+    /// below the old bound, and never exceed half the night.
+    func testOnsetSearchReachWidensButNeverShrinksOrEatsTheNight() {
+        let t = SleepStaging.Tuning.default
+        // A long night: reach grows past the fixed bound so a late onset is reachable.
+        XCTAssertEqual(SleepStaging.onsetSearchReach(epochCount: 258, tuning: t), 129)
+        XCTAssertGreaterThan(SleepStaging.onsetSearchReach(epochCount: 258, tuning: t), 72,
+                             "the grounding night's real onset (epoch 72) must be inside the reach")
+        // A short night: never shorter than the old fixed bound, never more than the night itself.
+        XCTAssertEqual(SleepStaging.onsetSearchReach(epochCount: 60, tuning: t), t.onsetSearchEpochs)
+        XCTAssertEqual(SleepStaging.onsetSearchReach(epochCount: 20, tuning: t), 20)
+        XCTAssertEqual(SleepStaging.onsetSearchReach(epochCount: 0, tuning: t), 0)
     }
 
     // MARK: - Constructed-night partition (sanity vs. RingConn night totals)

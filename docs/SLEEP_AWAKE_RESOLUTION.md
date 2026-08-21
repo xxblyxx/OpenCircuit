@@ -253,10 +253,24 @@ display bug, not a detection gap. Fixed by anchoring `domain.start` on `SleepSta
 with a bounded 30-min lead-in (so a badly-wrong onset stays visible as an anomaly rather than
 disappearing off-chart). See the `fix/sleep-onset-late-start` branch.
 
-That same investigation also found a genuine ONSET-DETECTION miss the classifier had not covered:
-a wearer quietly awake at resting HR (phone, reading) for an extended stretch is indistinguishable
-from real sleep on motion + HR alone — neither channel this document discusses moves. The fix
-(`markLeadInVitalsAwake`, `Tuning.leadInVitalsAwakeRatio`) uses sleep-vitals (HRV) epoch density
-instead, the same signal `sleepVitalsRescue`/`rescueSecondBoutHRWake` already trust elsewhere in
-this file's codebase, mirrored to the leading edge. See `docs/SLEEP_INTERIOR_AROUSALS.md`'s §4
-warning (updated) and `docs/PENDING_VALIDATION.md` → `lead-in-vitals-ratio-refit`.
+That same investigation also found a genuine ONSET-DETECTION miss the classifier had not covered.
+The wearer was in bed and STILL from 22:11, awake on a phone, got up 23:44–00:39 to work at a
+computer, and actually fell asleep ~00:48. Our onset landed at **22:11** — 2.5 h early — because
+that first still-but-awake stretch is indistinguishable from sleep on HR (54–73, at the sleeping
+floor) and is motionless. Every onset pass this document discusses keys on one of those two channels.
+
+**The fix is `markLeadInMotionOnset` (`Tuning.leadInMotionOnsetMinRun`): anchor onset after the last
+sustained motion episode in the leading region — sleep starts when the moving stops.** 🟢 On that
+night the de-floored motion channel is silent for 175 consecutive epochs of real sleep and plainly
+active across the getting-up, and the pass lands onset at 00:41:36 (NOOP 00:48:55, Apple Watch
+00:59:29). Two non-obvious details are load-bearing and are documented on the pass itself: the
+episode must be CLUSTERED before it is measured (a sustained episode lifts its own rolling floor, so
+it arrives as runs of 3,1,5,3,2,1 rather than one run), and the mid-night-WASO guard has to be the
+motion's DURATION, not the usual "consolidated sleep behind it" — on this night the quiet-awake
+lead-in reads as asleep, so that guard reverted the fix.
+
+⚠️ A first attempt, `markLeadInVitalsAwake` (sleep-vitals/HRV epoch density), is 🔴 REFUTED and now
+ships disabled: the density gap is real in aggregate (21% vs 50%) but not window-by-window, so it
+recovered only 30 min of the 2.5 h. See `docs/PENDING_VALIDATION.md` → `lead-in-vitals-ratio-refit`
+(Settled) for why, and `lead-in-motion-onset-refit` (Open) for what still needs confirming about the
+motion pass. Also `docs/SLEEP_INTERIOR_AROUSALS.md` §4's warning box.
